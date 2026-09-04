@@ -194,9 +194,20 @@ gitops-down:
 	kind delete cluster --name $(GITOPS_CLUSTER)
 
 # ---- GitOps ----------------------------------------------------------
+# --server-side, not a plain apply. Client-side apply stores the entire
+# object in the kubectl.kubernetes.io/last-applied-configuration
+# annotation, and annotations are capped at 262144 bytes. Argo CD's
+# ApplicationSet CRD is bigger than the cap by itself, so a plain apply
+# fails with
+#   The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+#   metadata.annotations: Too long: may not be more than 262144 bytes
+# and the install stops half-done. Server-side apply records ownership in
+# managedFields and has no size limit. --force-conflicts makes re-runs
+# idempotent: it takes ownership of fields a previous client-side apply
+# claimed, which is what happens when this target is run twice.
 argocd:
 	$(ARGO_KUBECTL) create namespace argocd --dry-run=client -o yaml | $(ARGO_KUBECTL) apply -f -
-	$(ARGO_KUBECTL) apply -n argocd -f $(ARGOCD_MANIFEST)
+	$(ARGO_KUBECTL) apply -n argocd --server-side --force-conflicts -f $(ARGOCD_MANIFEST)
 	$(ARGO_KUBECTL) -n argocd rollout status deploy/argocd-server --timeout=10m
 
 argocd-password:

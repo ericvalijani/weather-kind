@@ -73,7 +73,11 @@ restart_app() {
 install_argocd() {
 	log "installing Argo CD $ARGOCD_VERSION"
 	kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -n argocd \
+	# --server-side: the ApplicationSet CRD exceeds the 262144-byte
+	# annotation limit that client-side apply needs for
+	# last-applied-configuration, so a plain apply cannot install it.
+	# --force-conflicts keeps re-runs idempotent. Same as `make argocd`.
+	kubectl apply -n argocd --server-side --force-conflicts \
 		-f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
 
 	log "waiting for Argo CD to become ready"

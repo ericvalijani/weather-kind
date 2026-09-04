@@ -1,24 +1,63 @@
 #!/usr/bin/env bash
+# generate.sh - recreate the whole weather-kind project from scratch.
 #
-# Recreates the weather-kind tree from scratch.
+#   ./generate.sh                 # writes into ./weather-kind
+#   ./generate.sh my-dir          # writes into ./my-dir
+#   ./generate.sh my-dir --force  # allowed to write into a non-empty dir
+#   ./generate.sh --force         # ... default dir, also fine
 #
-#   ./generate.sh [target-directory]     # default: weather-kind
-#
-# It only ever creates: no rm, no truncation of anything it did not
-# write. Running it into an existing directory overwrites the files it
-# knows about and leaves everything else alone.
-#
-# app/genproto/ is deliberately absent - the gRPC stubs are generated
-# inside the Docker build (see app/Dockerfile) and by `make test`.
+# This script only ever creates files. It never deletes anything - an
+# earlier version of this generator started with "rm -rf $ROOT", which is
+# exactly the kind of line you only forgive once.
 set -euo pipefail
 
-TARGET="${1:-weather-kind}"
-mkdir -p "$TARGET"
-cd "$TARGET"
+ROOT=""
+FORCE=no
 
-mkdir -p ".github/workflows" "app" "app/proto" "charts/weather" "charts/weather/files" "charts/weather/templates" "charts/weather/templates/tests" "gitops" "gitops/argocd" "kind"
+# Accept --force in any position, so the flag alone still uses the
+# default directory instead of being mistaken for one.
+for arg in "$@"; do
+	case "$arg" in
+		--force) FORCE=yes ;;
+		-h | --help)
+			sed -n '2,8p' "$0"
+			exit 0
+			;;
+		-*)
+			echo "error: unknown option '$arg'" >&2
+			exit 1
+			;;
+		*) ROOT="$arg" ;;
+	esac
+done
 
-cat > ".gitignore" <<'KINDGEN_EOF'
+ROOT="${ROOT:-weather-kind}"
+
+if [[ -e "$ROOT" && -n "$(ls -A "$ROOT" 2>/dev/null || true)" && "$FORCE" != "yes" ]]; then
+	echo "error: '$ROOT' already exists and is not empty." >&2
+	echo "       pass --force to write into it anyway, or pick another directory." >&2
+	exit 1
+fi
+
+echo "generating into $ROOT"
+mkdir -p "$ROOT"
+cd "$ROOT"
+
+# ---- directories -----------------------------------------------------
+mkdir -p .github/workflows
+mkdir -p app
+mkdir -p app/proto
+mkdir -p charts/weather
+mkdir -p charts/weather/files
+mkdir -p charts/weather/templates
+mkdir -p charts/weather/templates/tests
+mkdir -p gitops
+mkdir -p gitops/argocd
+mkdir -p kind
+
+# ---- project docs and top-level files ------------------------------
+echo '  .gitignore'
+cat > .gitignore <<'KINDGEN_EOF'
 # Local kubeconfig exports, if you ever write one out
 kubeconfig
 *.kubeconfig
@@ -36,7 +75,8 @@ app/genproto/
 .vscode/
 KINDGEN_EOF
 
-cat > "HANDOFF.md" <<'KINDGEN_EOF'
+echo '  HANDOFF.md'
+cat > HANDOFF.md <<'KINDGEN_EOF'
 # HANDOFF - weather-kind (Kubernetes / kind track, v1)
 
 Written for whoever opens this repo next, including future me. It covers
@@ -639,45 +679,38 @@ DeadlineExceeded` once or twice at startup. It is publishing before store has
 finished connecting to Postgres; RabbitMQ redelivers and the reading lands a few
 seconds later. Consistent with the log showing `stored id=1` right after.
 
-### 10.14 Two more from the first real run
+### 10.15 Argo CD will not install with a plain kubectl apply
 
-**A passing smoke test reported failure.** `helm test` printed `Phase:
-Succeeded` and then `make smoke` exited 1 with `unable to get pod logs for
-weather-smoke: pods "weather-smoke" not found`. Two of my own changes
-collided: `--logs` (added so a failing test shows its output) and
-`helm.sh/hook-delete-policy: ...,hook-succeeded` (which deletes the pod the
-instant it passes). Helm deleted the pod, then went looking for its logs.
-Fix: drop `hook-succeeded`. `before-hook-creation` still guarantees one pod at
-a time, and the pod that stays behind is exactly what `--logs` needs. Second
-time in three passes that the test harness, not the app, was the liar.
+`make gitops-up` got as far as the Argo CD manifest and stopped:
 
-**CI's e2e job never got a cluster.** Not our chart, not our image - kind
-itself:
+    networkpolicy.networking.k8s.io/argocd-server-network-policy unchanged
+    The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+    metadata.annotations: Too long: may not be more than 262144 bytes
+    make[1]: *** [Makefile:199: argocd] Error 1
 
-    x Starting control-plane
-    ERROR: failed to create cluster: failed to init node with kubeadm
-    error: your configuration file uses an old API spec: "kubeadm.k8s.io/v1beta3"
+Client-side `kubectl apply` keeps a full copy of every object it applies in
+that object's `kubectl.kubernetes.io/last-applied-configuration` annotation,
+so it can compute a three-way diff next time. Annotations are limited to
+262144 bytes. Argo CD's ApplicationSet CRD, with its complete OpenAPI schema
+inlined, is larger than the limit on its own - so the annotation the apply
+must write is rejected, and no amount of retrying helps. Note the earlier
+lines said `unchanged` and `created`: the install is partly done when it dies,
+which is why the fix has to be re-runnable rather than starting clean.
 
-kind generates the kubeadm config and chooses its API version from the target
-Kubernetes release - v1beta3 through 1.35.x, v1beta4 from 1.36.0 - and v1beta4
-support landed after kind v0.31.0. Kubernetes 1.37 removed v1beta3. So the
-workflow's `version: v0.31.0` and `node_image: kindest/node:v1.37.0` were
-mutually exclusive, while the same node image worked locally because the local
-kind is newer. CI now pins v0.33.0, and README's Versions section states the
-pairing.
+`kubectl apply --server-side` moves the bookkeeping to `managedFields` on the
+object, tracked per field by the API server, with no annotation and no size
+ceiling. `--force-conflicts` is what makes a second run work: fields already
+owned by the earlier client-side apply are taken over instead of reported as
+conflicts. Both `make argocd` and `kind/bootstrap.sh` now apply this way.
 
-What this cost, and the lesson: eleven static passes could not have found it.
-`helm lint`, `helm template`, YAML and JSON validation, cross-file grep - all
-pass, because nothing in any file is malformed. The incompatibility exists only
-between a binary version and an image version, and only surfaces when something
-really calls `kubeadm init`. Two independently correct pins, wrong together.
-This is what `renovate.json`'s custom managers are for: one watches `version:`
-under `helm/kind-action`, another watches `kindest/node` in both
-`kind/cluster.yaml` and `ci.yml`, so the pair moves together instead of
-drifting apart.
+Worth knowing generally: this is a property of the Argo CD manifest's size,
+not of kind or of this project, and it affects the upstream install
+instructions the same way on any cluster. Argo CD's own docs recommend
+server-side apply for exactly this reason.
 KINDGEN_EOF
 
-cat > "Makefile" <<'KINDGEN_EOF'
+echo '  Makefile'
+cat > Makefile <<'KINDGEN_EOF'
 .PHONY: help up cluster image deploy status logs urls test smoke psql redis-cli \
         argocd argocd-password argocd-ui gitops template lint down clean \
         gitops-up gitops-down gitops-urls gitops-status
@@ -874,9 +907,20 @@ gitops-down:
 	kind delete cluster --name $(GITOPS_CLUSTER)
 
 # ---- GitOps ----------------------------------------------------------
+# --server-side, not a plain apply. Client-side apply stores the entire
+# object in the kubectl.kubernetes.io/last-applied-configuration
+# annotation, and annotations are capped at 262144 bytes. Argo CD's
+# ApplicationSet CRD is bigger than the cap by itself, so a plain apply
+# fails with
+#   The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+#   metadata.annotations: Too long: may not be more than 262144 bytes
+# and the install stops half-done. Server-side apply records ownership in
+# managedFields and has no size limit. --force-conflicts makes re-runs
+# idempotent: it takes ownership of fields a previous client-side apply
+# claimed, which is what happens when this target is run twice.
 argocd:
 	$(ARGO_KUBECTL) create namespace argocd --dry-run=client -o yaml | $(ARGO_KUBECTL) apply -f -
-	$(ARGO_KUBECTL) apply -n argocd -f $(ARGOCD_MANIFEST)
+	$(ARGO_KUBECTL) apply -n argocd --server-side --force-conflicts -f $(ARGOCD_MANIFEST)
 	$(ARGO_KUBECTL) -n argocd rollout status deploy/argocd-server --timeout=10m
 
 argocd-password:
@@ -901,7 +945,8 @@ gitops:
 		gitops/argocd/application.yaml | $(ARGO_KUBECTL) apply -f -
 KINDGEN_EOF
 
-cat > "PROMPT.md" <<'KINDGEN_EOF'
+echo '  PROMPT.md'
+cat > PROMPT.md <<'KINDGEN_EOF'
 # PROMPT.md - weather-kind
 
 This is the spec the project is generated from. Hand it (plus
@@ -1233,7 +1278,8 @@ work, and every one of them costs memory or moving parts on an 8GB laptop.
   host ports differ between the two clusters.
 KINDGEN_EOF
 
-cat > "README.md" <<'KINDGEN_EOF'
+echo '  README.md'
+cat > README.md <<'KINDGEN_EOF'
 # weather-kind
 
 The same small weather stack as the Docker Compose version, but running on
@@ -1445,13 +1491,6 @@ kind node v1.37.0, Helm >= 4.2.4 (Helm 3.21.x still works, security
 fixes until Nov 2026), Argo CD v3.5.2, Go 1.26 (matching `go.mod`).
 Re-check before bumping — see PROMPT.md for the version policy.
 
-One pairing to respect: the **kind CLI must be v0.32.0 or newer** for
-the v1.37.0 node image. kind writes the kubeadm config, and only
-v0.32+ writes the v1beta4 format that Kubernetes 1.37 accepts - older
-kind fails at `kubeadm init` with `old API spec: kubeadm.k8s.io/v1beta3`
-before the control plane ever starts. Check with `kind version`. CI
-pins v0.33.0 in `.github/workflows/ci.yml` for the same reason.
-
 ## GitOps track (optional, second cluster)
 
 The default workflow above is imperative: you run `make image`, Helm changes the
@@ -1591,7 +1630,8 @@ Postgres 18 moving its data directory is exactly the kind of change a grouped
 batch would have hidden.
 KINDGEN_EOF
 
-cat > "renovate.json" <<'KINDGEN_EOF'
+echo '  renovate.json'
+cat > renovate.json <<'KINDGEN_EOF'
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
@@ -1689,236 +1729,15 @@ cat > "renovate.json" <<'KINDGEN_EOF'
 }
 KINDGEN_EOF
 
-cat > ".github/workflows/ci.yml" <<'KINDGEN_EOF'
-name: CI
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  # Must match go.mod and app/Dockerfile. A CI runner on an older
-  # toolchain than the module requires fails on the very first run.
-  GO_VERSION: "1.26"
-
-jobs:
-  # ---- 1. the Go code -------------------------------------------------
-  test:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: app
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - name: Install protoc and plugins
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Generate gRPC stubs
-        run: |
-          protoc --go_out=. --go_opt=module=weather \
-                 --go-grpc_out=. --go-grpc_opt=module=weather \
-                 proto/weather.proto
-      - name: Vet and test
-        run: |
-          go mod tidy
-          go vet ./...
-          go test ./...
-
-  # ---- 2. the chart ---------------------------------------------------
-  chart:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-        with:
-          version: v4.2.4
-      - name: Lint and render
-        run: |
-          helm lint charts/weather --values charts/weather/values-kind.yaml
-          helm template weather charts/weather \
-            --values charts/weather/values-kind.yaml > /dev/null
-          # values-gitops.yaml needs this more than values-kind.yaml does,
-          # not less: it is the one values file a machine writes to (the
-          # bump job seds a digest into it). Unchecked, a bad write shows
-          # up as an Argo CD ComparisonError on the cluster instead of a
-          # red check on the pull request.
-          helm lint charts/weather --values charts/weather/values-gitops.yaml
-          helm template weather charts/weather \
-            --values charts/weather/values-gitops.yaml > /dev/null
-
-  # ---- 3. does it actually run on Kubernetes? -------------------------
-  # A real kind cluster in CI, so a broken manifest fails here instead of
-  # on the laptop.
-  e2e:
-    needs: [test, chart]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-        with:
-          version: v4.2.4
-      # These two versions are one pin, not two. kind generates the
-      # kubeadm config itself and picks the API version from the target
-      # Kubernetes release: v1beta3 up to 1.35.x, v1beta4 from 1.36.0 -
-      # and that v1beta4 support landed after kind v0.31.0. Kubernetes
-      # 1.37 removed v1beta3 outright, so kind v0.31.0 with this node
-      # image fails at `kubeadm init` with "old API spec" and the
-      # cluster never starts. Bump both together or neither.
-      - uses: helm/kind-action@v1
-        with:
-          version: v0.33.0
-          node_image: kindest/node:v1.37.0
-          cluster_name: weather-ci
-      - name: Build and load image
-        run: |
-          docker build -t weather:ci app
-          kind load docker-image weather:ci --name weather-ci
-      - name: Install chart
-        run: |
-          helm upgrade --install weather charts/weather \
-            --namespace weather --create-namespace \
-            --set image.tag=ci \
-            --set nodePorts.enabled=false \
-            --wait --timeout 10m
-      # The chart's own test hook, so CI and `make smoke` check exactly
-      # the same thing: api -> store gRPC -> Postgres, not just /healthz.
-      - name: Smoke test the release
-        run: helm test weather --namespace weather --timeout 5m
-      - name: Smoke test output
-        if: always()
-        run: kubectl -n weather logs weather-smoke || true
-      # Diagnostics only. Every line ends in `|| true`: if the cluster
-      # never came up, kubectl exits 1 here and THIS step becomes the
-      # only red one in the run, hiding the step that actually failed.
-      - name: Dump state on failure
-        if: failure()
-        continue-on-error: true
-        run: |
-          kubectl -n weather get pods -o wide || true
-          kubectl -n weather describe pods || true
-          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100 || true
-          kubectl get nodes -o wide || true
-
-  # ---- 4. publish -----------------------------------------------------
-  build-and-push:
-    needs: e2e
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    permissions:
-      contents: read
-      packages: write
-    # Passed to the bump job below. This is the digest of what was
-    # actually pushed - the one thing a tag cannot be trusted to tell you.
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=short
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: ./app
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # ---- 5. hand the new image to GitOps --------------------------------
-  # Argo CD deploys what git says, and git does not change when a new
-  # image is pushed - so something has to write the new reference back.
-  # That is this job. It opens a pull request instead of pushing to main:
-  # you get a diff to approve, branch protection still applies, and CI
-  # does not trigger itself in a loop.
-  #
-  # Requires: Settings -> Actions -> General -> "Allow GitHub Actions to
-  # create and approve pull requests". Without it this job fails with a
-  # 403 and nothing else explains why.
-  bump:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Pin the digest that was just pushed
-        env:
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
-        run: |
-          test -n "$DIGEST" || { echo "build-and-push produced no digest" >&2; exit 1; }
-          sed -i -E "s|^(  digest: ).*|\1\"$DIGEST\"|" charts/weather/values-gitops.yaml
-          grep -n '  digest:' charts/weather/values-gitops.yaml
-      # Prove the edit produced a chart that still renders, and that the
-      # digest actually reached the pod spec, before asking anyone to merge.
-      - uses: azure/setup-helm@v4
-        with:
-          version: v4.2.4
-      - name: Check the chart renders with the new digest
-        env:
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
-        run: |
-          helm template weather charts/weather \
-            --values charts/weather/values-gitops.yaml \
-            | grep -qF "@$DIGEST" \
-            || { echo "rendered manifests do not reference $DIGEST" >&2; exit 1; }
-      # No change means the image content did not change (the digest is
-      # content-addressed, so a docs-only commit rebuilds to the same
-      # digest). In that case this action does nothing at all, which is
-      # what stops the merge -> build -> bump loop.
-      - name: Open the deploy pull request
-        uses: peter-evans/create-pull-request@v7
-        with:
-          branch: deploy/image-digest
-          delete-branch: true
-          commit-message: "deploy: pin image ${{ needs.build-and-push.outputs.digest }}"
-          title: "deploy: pin image digest"
-          labels: deploy
-          body: |
-            CI built and pushed a new image. Merging this pull request is
-            what deploys it: Argo CD syncs `charts/weather` on the
-            `weather-gitops` cluster and rolls the three app deployments.
-
-            - digest: `${{ needs.build-and-push.outputs.digest }}`
-            - commit: ${{ github.sha }}
-
-            The digest is immutable, so what gets deployed is exactly
-            what the checks above passed on.
-KINDGEN_EOF
-
-cat > "app/.dockerignore" <<'KINDGEN_EOF'
+# ---- Go application (unchanged from the compose track) -------------
+echo '  app/.dockerignore'
+cat > app/.dockerignore <<'KINDGEN_EOF'
 genproto/
 *.md
 KINDGEN_EOF
 
-cat > "app/Dockerfile" <<'KINDGEN_EOF'
+echo '  app/Dockerfile'
+cat > app/Dockerfile <<'KINDGEN_EOF'
 # ---- build stage: generate gRPC stubs + compile ----
 FROM golang:1.26-alpine AS build
 RUN apk add --no-cache protobuf protobuf-dev git
@@ -1946,7 +1765,8 @@ COPY --from=build /weather /weather
 ENTRYPOINT ["/weather"]
 KINDGEN_EOF
 
-cat > "app/api.go" <<'KINDGEN_EOF'
+echo '  app/api.go'
+cat > app/api.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2065,7 +1885,8 @@ func runFetchLoop(cfg apiConfig) {
 }
 KINDGEN_EOF
 
-cat > "app/city_cache.go" <<'KINDGEN_EOF'
+echo '  app/city_cache.go'
+cat > app/city_cache.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2199,7 +2020,8 @@ func addCityToStore(storeHTTP string, c cityCoord) error {
 }
 KINDGEN_EOF
 
-cat > "app/city_cache_test.go" <<'KINDGEN_EOF'
+echo '  app/city_cache_test.go'
+cat > app/city_cache_test.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2281,7 +2103,8 @@ func TestConcurrentCityCacheAccess(t *testing.T) {
 }
 KINDGEN_EOF
 
-cat > "app/consumer.go" <<'KINDGEN_EOF'
+echo '  app/consumer.go'
+cat > app/consumer.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2397,7 +2220,8 @@ func runConsumer() {
 }
 KINDGEN_EOF
 
-cat > "app/go.mod" <<'KINDGEN_EOF'
+echo '  app/go.mod'
+cat > app/go.mod <<'KINDGEN_EOF'
 module weather
 
 go 1.26
@@ -2412,7 +2236,8 @@ require (
 )
 KINDGEN_EOF
 
-cat > "app/http_handlers.go" <<'KINDGEN_EOF'
+echo '  app/http_handlers.go'
+cat > app/http_handlers.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2669,7 +2494,8 @@ func (s *apiServer) fetchAndStoreNow(c cityCoord) {
 }
 KINDGEN_EOF
 
-cat > "app/http_handlers_test.go" <<'KINDGEN_EOF'
+echo '  app/http_handlers_test.go'
+cat > app/http_handlers_test.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2727,7 +2553,8 @@ func TestErrProvideCityNameMessage(t *testing.T) {
 }
 KINDGEN_EOF
 
-cat > "app/main.go" <<'KINDGEN_EOF'
+echo '  app/main.go'
+cat > app/main.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2768,7 +2595,8 @@ func main() {
 }
 KINDGEN_EOF
 
-cat > "app/metrics.go" <<'KINDGEN_EOF'
+echo '  app/metrics.go'
+cat > app/metrics.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2800,7 +2628,8 @@ var (
 )
 KINDGEN_EOF
 
-cat > "app/parse_test.go" <<'KINDGEN_EOF'
+echo '  app/parse_test.go'
+cat > app/parse_test.go <<'KINDGEN_EOF'
 package main
 
 import "testing"
@@ -2829,7 +2658,37 @@ func TestParseCitiesSkipsMalformed(t *testing.T) {
 }
 KINDGEN_EOF
 
-cat > "app/store.go" <<'KINDGEN_EOF'
+echo '  app/proto/weather.proto'
+cat > app/proto/weather.proto <<'KINDGEN_EOF'
+syntax = "proto3";
+package weather;
+option go_package = "weather/genproto;genproto";
+
+message Reading {
+  string city = 1;
+  double latitude = 2;
+  double longitude = 3;
+  double temperature_c = 4;
+  double windspeed_kph = 5;
+  string observed_at = 6;
+  string source = 7;
+}
+
+message AddReadingResponse { int64 id = 1; }
+message GetLatestRequest { string city = 1; }
+message GetLatestResponse {
+  Reading reading = 1;
+  bool found = 2;
+}
+
+service WeatherStore {
+  rpc AddReading(Reading) returns (AddReadingResponse);
+  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
+}
+KINDGEN_EOF
+
+echo '  app/store.go'
+cat > app/store.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -2998,7 +2857,8 @@ func seedCities(db *sql.DB, csv string) {
 }
 KINDGEN_EOF
 
-cat > "app/store_http.go" <<'KINDGEN_EOF'
+echo '  app/store_http.go'
+cat > app/store_http.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -3107,7 +2967,8 @@ func (s *storeHTTPServer) handleCitiesPost(w http.ResponseWriter, r *http.Reques
 }
 KINDGEN_EOF
 
-cat > "app/ui_page.go" <<'KINDGEN_EOF'
+echo '  app/ui_page.go'
+cat > app/ui_page.go <<'KINDGEN_EOF'
 package main
 
 // weatherUIHTML is the entire frontend: one static page (HTML + CSS + JS),
@@ -3440,7 +3301,8 @@ loadCities();
 </html>`
 KINDGEN_EOF
 
-cat > "app/weather_fetch.go" <<'KINDGEN_EOF'
+echo '  app/weather_fetch.go'
+cat > app/weather_fetch.go <<'KINDGEN_EOF'
 package main
 
 import (
@@ -3600,35 +3462,9 @@ func publishAll(amqpURL, queue string, cities []cityCoord) {
 }
 KINDGEN_EOF
 
-cat > "app/proto/weather.proto" <<'KINDGEN_EOF'
-syntax = "proto3";
-package weather;
-option go_package = "weather/genproto;genproto";
-
-message Reading {
-  string city = 1;
-  double latitude = 2;
-  double longitude = 3;
-  double temperature_c = 4;
-  double windspeed_kph = 5;
-  string observed_at = 6;
-  string source = 7;
-}
-
-message AddReadingResponse { int64 id = 1; }
-message GetLatestRequest { string city = 1; }
-message GetLatestResponse {
-  Reading reading = 1;
-  bool found = 2;
-}
-
-service WeatherStore {
-  rpc AddReading(Reading) returns (AddReadingResponse);
-  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
-}
-KINDGEN_EOF
-
-cat > "charts/weather/Chart.yaml" <<'KINDGEN_EOF'
+# ---- Helm chart ----------------------------------------------------
+echo '  charts/weather/Chart.yaml'
+cat > charts/weather/Chart.yaml <<'KINDGEN_EOF'
 apiVersion: v2
 name: weather
 description: Multi-service weather stack (Go store/api/consumer + Postgres, Redis, RabbitMQ, Prometheus, Grafana)
@@ -3645,185 +3481,8 @@ maintainers:
   - name: ericvalijani
 KINDGEN_EOF
 
-cat > "charts/weather/values-gitops.yaml" <<'KINDGEN_EOF'
-# Overrides for the GitOps cluster (kind/cluster-gitops.yaml).
-#
-# Argo CD reads THIS file, not values-kind.yaml. The difference that
-# matters: the image comes from GHCR and is pinned by digest, because
-# nothing here is built locally or side-loaded with `kind load`.
-
-image:
-  # Must be lowercase and must match the GHCR package name, which is
-  # ghcr.io/<owner>/<repo> from the CI workflow.
-  repository: ghcr.io/ericvalijani/weather-kind
-
-  # Used only until CI has pinned a digest below. `latest` is a moving
-  # target on purpose here: it is the bootstrap value, not the steady
-  # state.
-  tag: latest
-
-  # The steady state. CI's `bump` job opens a pull request that fills
-  # this in with the digest it just pushed, e.g.
-  #   digest: "sha256:9f86d0818..."
-  # A digest cannot be moved or overwritten the way a tag can, so what
-  # Argo CD deploys is exactly what CI built. When this is non-empty it
-  # wins and `tag` is ignored (see weather.image in _helpers.tpl).
-  digest: ""
-
-  # Safe with a digest: the reference is immutable, so a cached image is
-  # by definition the right one.
-  pullPolicy: IfNotPresent
-
-app:
-  # The default, unlike values-kind.yaml. This cluster is meant to sit
-  # there and be reconciled, not to fill up with data while you watch.
-  fetchInterval: 300s
-
-nodePorts:
-  enabled: true
-
-ingress:
-  enabled: false
-
-# Off to leave room for Argo CD's five pods on an 8GB machine. This
-# cluster is for watching deployments happen, and the dev cluster still
-# has the full monitoring stack. Set either to true if you want them.
-prometheus:
-  enabled: false
-
-grafana:
-  enabled: false
-KINDGEN_EOF
-
-cat > "charts/weather/values-kind.yaml" <<'KINDGEN_EOF'
-# Overrides used for the local kind cluster.
-# `make deploy` passes this file with -f, on top of values.yaml.
-#
-# Kept deliberately thin: if a setting is the same everywhere, it belongs
-# in values.yaml, not here.
-
-image:
-  repository: weather
-  tag: dev
-  pullPolicy: IfNotPresent
-
-app:
-  # Shorter than the 300s default so a fresh cluster fills up with data
-  # while you are still looking at it.
-  fetchInterval: 120s
-
-nodePorts:
-  enabled: true
-
-ingress:
-  enabled: false
-KINDGEN_EOF
-
-cat > "charts/weather/values.yaml" <<'KINDGEN_EOF'
-# Default values for the weather chart.
-# Every image tag is pinned on purpose - no "latest" anywhere.
-
-# ---- application image (one image, three MODEs) ----------------------
-image:
-  repository: weather
-  tag: dev
-  # Set this and `tag` is ignored (see weather.image in _helpers.tpl).
-  # Empty here because weather:dev is built locally and side-loaded with
-  # `kind load` - it has no registry digest. The GitOps track pins one:
-  # see values-gitops.yaml, which CI keeps up to date.
-  digest: ""
-  # IfNotPresent is what makes `kind load docker-image` work: the image
-  # already exists on the node, so the kubelet must not try to pull it.
-  pullPolicy: IfNotPresent
-
-# ---- application settings (become a ConfigMap) -----------------------
-app:
-  apiPort: 8080
-  fetchInterval: 300s
-  cacheTtl: 120s
-  queue: weather.readings
-  # Seeds the cities table on the very first boot only. After that the
-  # database is the single source of truth.
-  cities: "Tehran:35.6892:51.3890,Berlin:52.5200:13.4050,Tokyo:35.6762:139.6503"
-  replicas:
-    api: 1
-    store: 1
-    consumer: 1
-
-# ---- data layer ------------------------------------------------------
-postgres:
-  image: postgres:18.4-alpine
-  user: weather
-  password: devpassword
-  database: weatherdb
-  # Postgres 18 expects the volume at /var/lib/postgresql, NOT at
-  # /var/lib/postgresql/data like every pre-18 tutorial shows.
-  mountPath: /var/lib/postgresql
-  storage: 2Gi
-
-redis:
-  image: redis:8.8.0-alpine
-
-rabbitmq:
-  image: rabbitmq:4.3.2-management-alpine
-  user: admin
-  password: devpassword
-  storage: 1Gi
-
-# ---- monitoring ------------------------------------------------------
-prometheus:
-  enabled: true
-  image: prom/prometheus:v3.12.0
-  scrapeInterval: 15s
-  storage: 2Gi
-
-grafana:
-  enabled: true
-  image: grafana/grafana:13.1.0
-  user: admin
-  password: devpassword
-  storage: 1Gi
-
-# ---- how you reach the cluster --------------------------------------
-# NodePorts are the default because they line up with the
-# extraPortMappings in kind/cluster.yaml - no ingress controller needed.
-nodePorts:
-  enabled: true
-  api: 30080
-  grafana: 30300
-  prometheus: 30900
-  rabbitmq: 31567
-
-# Optional. Only turn this on after installing an ingress controller
-# yourself (see README - ingress-nginx is retired, Traefik is the
-# maintained option). Requires a hosts-file entry for the host below.
-ingress:
-  enabled: false
-  className: traefik
-  host: weather.local
-  annotations: {}
-
-# ---- resources (sized for an 8GB laptop) -----------------------------
-resources:
-  app:
-    requests:
-      cpu: 25m
-      memory: 32Mi
-    limits:
-      memory: 128Mi
-  data:
-    requests:
-      cpu: 50m
-      memory: 128Mi
-    limits:
-      memory: 512Mi
-
-# Kind ships the local-path provisioner as the default StorageClass, so
-# leaving this empty is correct for a kind cluster.
-storageClassName: ""
-KINDGEN_EOF
-
-cat > "charts/weather/files/grafana-dashboard-weather.json" <<'KINDGEN_EOF'
+echo '  charts/weather/files/grafana-dashboard-weather.json'
+cat > charts/weather/files/grafana-dashboard-weather.json <<'KINDGEN_EOF'
 {
   "annotations": { "list": [] },
   "editable": true,
@@ -3867,7 +3526,8 @@ cat > "charts/weather/files/grafana-dashboard-weather.json" <<'KINDGEN_EOF'
 }
 KINDGEN_EOF
 
-cat > "charts/weather/files/init.sql" <<'KINDGEN_EOF'
+echo '  charts/weather/files/init.sql'
+cat > charts/weather/files/init.sql <<'KINDGEN_EOF'
 CREATE TABLE IF NOT EXISTS weather_readings (
     id            BIGSERIAL PRIMARY KEY,
     city          TEXT NOT NULL,
@@ -3892,7 +3552,8 @@ CREATE TABLE IF NOT EXISTS cities (
 );
 KINDGEN_EOF
 
-cat > "charts/weather/templates/NOTES.txt" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/NOTES.txt'
+cat > charts/weather/templates/NOTES.txt <<'KINDGEN_EOF'
 weather {{ .Chart.Version }} deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
 Watch it come up:
@@ -3924,7 +3585,8 @@ Seeded cities (first boot only, the database is the source of truth after that):
   {{ .Values.app.cities }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/_helpers.tpl" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/_helpers.tpl'
+cat > charts/weather/templates/_helpers.tpl <<'KINDGEN_EOF'
 {{/*
 Shared naming + labels. Four helpers, that's the whole file:
 
@@ -3970,7 +3632,8 @@ Falls back to repository:tag, which is what the local kind cluster uses
 {{- end -}}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/api.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/api.yaml'
+cat > charts/weather/templates/api.yaml <<'KINDGEN_EOF'
 # weather-api: MODE=api. The fetch loop plus the public HTTP surface
 # (UI at "/", /readings/latest, /cities, /healthz, /metrics).
 apiVersion: apps/v1
@@ -4060,7 +3723,8 @@ spec:
       {{- end }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/config.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/config.yaml'
+cat > charts/weather/templates/config.yaml <<'KINDGEN_EOF'
 # Every non-secret env var the three Go modes read, in one ConfigMap -
 # the Kubernetes equivalent of the compose track's single .env file.
 #
@@ -4120,7 +3784,8 @@ data:
 {{ .Files.Get "files/init.sql" | indent 4 }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/consumer.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/consumer.yaml'
+cat > charts/weather/templates/consumer.yaml <<'KINDGEN_EOF'
 # weather-consumer: MODE=consumer. Drains the queue and writes through
 # store's gRPC. No ports, no service - nothing ever calls it.
 apiVersion: apps/v1
@@ -4160,7 +3825,8 @@ spec:
             {{- toYaml .Values.resources.app | nindent 12 }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/grafana.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/grafana.yaml'
+cat > charts/weather/templates/grafana.yaml <<'KINDGEN_EOF'
 {{- if .Values.grafana.enabled }}
 # Grafana, provisioned on first boot: one Prometheus datasource and one
 # starter dashboard. Nothing to click through in the UI to get a graph.
@@ -4331,7 +3997,8 @@ spec:
 {{- end }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/ingress.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/ingress.yaml'
+cat > charts/weather/templates/ingress.yaml <<'KINDGEN_EOF'
 {{- if .Values.ingress.enabled }}
 # Optional. Only useful once an ingress controller is installed in the
 # cluster (see README: ingress-nginx was retired in March 2026, Traefik
@@ -4362,7 +4029,8 @@ spec:
 {{- end }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/postgres.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/postgres.yaml'
+cat > charts/weather/templates/postgres.yaml <<'KINDGEN_EOF'
 # Postgres: the permanent record. StatefulSet (not Deployment) because it
 # owns a volume and its identity matters.
 apiVersion: apps/v1
@@ -4466,7 +4134,8 @@ spec:
       targetPort: postgres
 KINDGEN_EOF
 
-cat > "charts/weather/templates/prometheus.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/prometheus.yaml'
+cat > charts/weather/templates/prometheus.yaml <<'KINDGEN_EOF'
 {{- if .Values.prometheus.enabled }}
 # Prometheus. The scrape config is templated (not a static file) so the
 # targets follow the release name automatically.
@@ -4593,7 +4262,8 @@ spec:
 {{- end }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/rabbitmq.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/rabbitmq.yaml'
+cat > charts/weather/templates/rabbitmq.yaml <<'KINDGEN_EOF'
 # RabbitMQ: decouples the api's fetch loop from the consumer's writes.
 # StatefulSet for the same reason as Postgres - it keeps a volume.
 apiVersion: apps/v1
@@ -4704,7 +4374,8 @@ spec:
 {{- end }}
 KINDGEN_EOF
 
-cat > "charts/weather/templates/redis.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/redis.yaml'
+cat > charts/weather/templates/redis.yaml <<'KINDGEN_EOF'
 # Redis: cache of the latest reading per city. No volume on purpose -
 # a wiped cache costs one extra Postgres query, nothing more.
 apiVersion: apps/v1
@@ -4761,7 +4432,8 @@ spec:
       targetPort: redis
 KINDGEN_EOF
 
-cat > "charts/weather/templates/store.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/store.yaml'
+cat > charts/weather/templates/store.yaml <<'KINDGEN_EOF'
 # weather-store: MODE=store. gRPC on 9090, small REST surface on 9091.
 # The only workload allowed to talk to Postgres and Redis directly.
 apiVersion: apps/v1
@@ -4846,7 +4518,8 @@ spec:
       targetPort: http
 KINDGEN_EOF
 
-cat > "charts/weather/templates/tests/api-smoke.yaml" <<'KINDGEN_EOF'
+echo '  charts/weather/templates/tests/api-smoke.yaml'
+cat > charts/weather/templates/tests/api-smoke.yaml <<'KINDGEN_EOF'
 # `helm test` target: proves the deployed release actually answers, not
 # just that it rendered. Run it with `make smoke` (or `helm test`), and
 # CI runs it as the e2e smoke step.
@@ -4876,16 +4549,9 @@ metadata:
     # Skip means Argo CD never applies this manifest at all.
     argocd.argoproj.io/hook: Skip
     # Delete a leftover pod from a previous run before creating this one,
-    # and keep the pod afterwards - on a pass as well as on a failure.
-    #
-    # hook-succeeded is deliberately NOT here. With it, Helm deleted the
-    # pod the moment the test passed, and `helm test --logs` (see `make
-    # smoke`) then failed with `pods "weather-smoke" not found` - a
-    # PASSING test reported as an error. before-hook-creation alone still
-    # means only one pod ever exists: the next run removes it first. The
-    # cost is one Completed pod visible in `make status` between runs,
-    # which is also what makes the logs readable after the fact.
-    helm.sh/hook-delete-policy: before-hook-creation
+    # and clean up after a pass. Failures are kept so you can read the
+    # logs with `kubectl logs`.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
 spec:
   restartPolicy: Never
   containers:
@@ -4927,7 +4593,473 @@ spec:
         {{- toYaml .Values.resources.app | nindent 8 }}
 KINDGEN_EOF
 
-cat > "gitops/README.md" <<'KINDGEN_EOF'
+echo '  charts/weather/values-gitops.yaml'
+cat > charts/weather/values-gitops.yaml <<'KINDGEN_EOF'
+# Overrides for the GitOps cluster (kind/cluster-gitops.yaml).
+#
+# Argo CD reads THIS file, not values-kind.yaml. The difference that
+# matters: the image comes from GHCR and is pinned by digest, because
+# nothing here is built locally or side-loaded with `kind load`.
+
+image:
+  # Must be lowercase and must match the GHCR package name, which is
+  # ghcr.io/<owner>/<repo> from the CI workflow.
+  repository: ghcr.io/ericvalijani/weather-kind
+
+  # Used only until CI has pinned a digest below. `latest` is a moving
+  # target on purpose here: it is the bootstrap value, not the steady
+  # state.
+  tag: latest
+
+  # The steady state. CI's `bump` job opens a pull request that fills
+  # this in with the digest it just pushed, e.g.
+  #   digest: "sha256:9f86d0818..."
+  # A digest cannot be moved or overwritten the way a tag can, so what
+  # Argo CD deploys is exactly what CI built. When this is non-empty it
+  # wins and `tag` is ignored (see weather.image in _helpers.tpl).
+  digest: ""
+
+  # Safe with a digest: the reference is immutable, so a cached image is
+  # by definition the right one.
+  pullPolicy: IfNotPresent
+
+app:
+  # The default, unlike values-kind.yaml. This cluster is meant to sit
+  # there and be reconciled, not to fill up with data while you watch.
+  fetchInterval: 300s
+
+nodePorts:
+  enabled: true
+
+ingress:
+  enabled: false
+
+# Off to leave room for Argo CD's five pods on an 8GB machine. This
+# cluster is for watching deployments happen, and the dev cluster still
+# has the full monitoring stack. Set either to true if you want them.
+prometheus:
+  enabled: false
+
+grafana:
+  enabled: false
+KINDGEN_EOF
+
+echo '  charts/weather/values-kind.yaml'
+cat > charts/weather/values-kind.yaml <<'KINDGEN_EOF'
+# Overrides used for the local kind cluster.
+# `make deploy` passes this file with -f, on top of values.yaml.
+#
+# Kept deliberately thin: if a setting is the same everywhere, it belongs
+# in values.yaml, not here.
+
+image:
+  repository: weather
+  tag: dev
+  pullPolicy: IfNotPresent
+
+app:
+  # Shorter than the 300s default so a fresh cluster fills up with data
+  # while you are still looking at it.
+  fetchInterval: 120s
+
+nodePorts:
+  enabled: true
+
+ingress:
+  enabled: false
+KINDGEN_EOF
+
+echo '  charts/weather/values.yaml'
+cat > charts/weather/values.yaml <<'KINDGEN_EOF'
+# Default values for the weather chart.
+# Every image tag is pinned on purpose - no "latest" anywhere.
+
+# ---- application image (one image, three MODEs) ----------------------
+image:
+  repository: weather
+  tag: dev
+  # Set this and `tag` is ignored (see weather.image in _helpers.tpl).
+  # Empty here because weather:dev is built locally and side-loaded with
+  # `kind load` - it has no registry digest. The GitOps track pins one:
+  # see values-gitops.yaml, which CI keeps up to date.
+  digest: ""
+  # IfNotPresent is what makes `kind load docker-image` work: the image
+  # already exists on the node, so the kubelet must not try to pull it.
+  pullPolicy: IfNotPresent
+
+# ---- application settings (become a ConfigMap) -----------------------
+app:
+  apiPort: 8080
+  fetchInterval: 300s
+  cacheTtl: 120s
+  queue: weather.readings
+  # Seeds the cities table on the very first boot only. After that the
+  # database is the single source of truth.
+  cities: "Tehran:35.6892:51.3890,Berlin:52.5200:13.4050,Tokyo:35.6762:139.6503"
+  replicas:
+    api: 1
+    store: 1
+    consumer: 1
+
+# ---- data layer ------------------------------------------------------
+postgres:
+  image: postgres:18.4-alpine
+  user: weather
+  password: devpassword
+  database: weatherdb
+  # Postgres 18 expects the volume at /var/lib/postgresql, NOT at
+  # /var/lib/postgresql/data like every pre-18 tutorial shows.
+  mountPath: /var/lib/postgresql
+  storage: 2Gi
+
+redis:
+  image: redis:8.8.0-alpine
+
+rabbitmq:
+  image: rabbitmq:4.3.2-management-alpine
+  user: admin
+  password: devpassword
+  storage: 1Gi
+
+# ---- monitoring ------------------------------------------------------
+prometheus:
+  enabled: true
+  image: prom/prometheus:v3.12.0
+  scrapeInterval: 15s
+  storage: 2Gi
+
+grafana:
+  enabled: true
+  image: grafana/grafana:13.1.0
+  user: admin
+  password: devpassword
+  storage: 1Gi
+
+# ---- how you reach the cluster --------------------------------------
+# NodePorts are the default because they line up with the
+# extraPortMappings in kind/cluster.yaml - no ingress controller needed.
+nodePorts:
+  enabled: true
+  api: 30080
+  grafana: 30300
+  prometheus: 30900
+  rabbitmq: 31567
+
+# Optional. Only turn this on after installing an ingress controller
+# yourself (see README - ingress-nginx is retired, Traefik is the
+# maintained option). Requires a hosts-file entry for the host below.
+ingress:
+  enabled: false
+  className: traefik
+  host: weather.local
+  annotations: {}
+
+# ---- resources (sized for an 8GB laptop) -----------------------------
+resources:
+  app:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  data:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# Kind ships the local-path provisioner as the default StorageClass, so
+# leaving this empty is correct for a kind cluster.
+storageClassName: ""
+KINDGEN_EOF
+
+# ---- kind cluster + bootstrap --------------------------------------
+echo '  kind/bootstrap.sh'
+cat > kind/bootstrap.sh <<'KINDGEN_EOF'
+#!/usr/bin/env bash
+# Bring the whole stack up on a fresh kind cluster, in one command.
+#
+#   ./kind/bootstrap.sh          # cluster + image + helm release
+#   ./kind/bootstrap.sh --argocd # ... plus Argo CD and the GitOps app
+#
+# Every step is idempotent: run it again after a change and it does the
+# right thing instead of complaining.
+set -euo pipefail
+
+CLUSTER="${CLUSTER:-weather}"
+NAMESPACE="${NAMESPACE:-weather}"
+RELEASE="${RELEASE:-weather}"
+IMAGE="${IMAGE:-weather:dev}"
+ARGOCD_VERSION="${ARGOCD_VERSION:-v3.5.2}"
+# Overridable so the same script can bring up the GitOps cluster, which
+# has its own host ports and its own values file.
+CLUSTER_CONFIG="${CLUSTER_CONFIG:-kind/cluster.yaml}"
+VALUES="${VALUES:-charts/weather/values-kind.yaml}"
+
+# Run from the project root no matter where the script is called from.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+
+require() {
+	for cmd in "$@"; do
+		command -v "$cmd" >/dev/null || { echo "missing required tool: $cmd" >&2; exit 1; }
+	done
+}
+
+create_cluster() {
+	if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+		log "cluster '$CLUSTER' already exists, keeping it"
+	else
+		log "creating kind cluster '$CLUSTER'"
+		kind create cluster --name "$CLUSTER" --config "$CLUSTER_CONFIG"
+	fi
+	kubectl config use-context "kind-${CLUSTER}" >/dev/null
+}
+
+build_and_load() {
+	log "building $IMAGE"
+	docker build -t "$IMAGE" app
+
+	# kind nodes have their own containerd, so a locally built image has to
+	# be copied in. This is why the chart uses pullPolicy: IfNotPresent -
+	# there is no registry to pull weather:dev from.
+	log "loading $IMAGE into the cluster"
+	kind load docker-image "$IMAGE" --name "$CLUSTER"
+}
+
+deploy() {
+	log "installing helm release '$RELEASE'"
+	helm upgrade --install "$RELEASE" charts/weather \
+		--namespace "$NAMESPACE" --create-namespace \
+		--values "$VALUES" \
+		--wait --timeout 10m
+}
+
+# On a re-run nothing in the chart has changed, so helm makes no changes
+# and the pods keep running the OLD image - even though a new weather:dev
+# was just loaded. Restarting the three app deployments is what makes
+# `./kind/bootstrap.sh` pick up code changes.
+restart_app() {
+	log "restarting app pods so they pick up the new image"
+	kubectl -n "$NAMESPACE" rollout restart \
+		"deploy/${RELEASE}-api" "deploy/${RELEASE}-store" "deploy/${RELEASE}-consumer"
+	kubectl -n "$NAMESPACE" rollout status "deploy/${RELEASE}-api" --timeout=5m
+}
+
+install_argocd() {
+	log "installing Argo CD $ARGOCD_VERSION"
+	kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+	# --server-side: the ApplicationSet CRD exceeds the 262144-byte
+	# annotation limit that client-side apply needs for
+	# last-applied-configuration, so a plain apply cannot install it.
+	# --force-conflicts keeps re-runs idempotent. Same as `make argocd`.
+	kubectl apply -n argocd --server-side --force-conflicts \
+		-f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
+
+	log "waiting for Argo CD to become ready"
+	kubectl -n argocd rollout status deploy/argocd-server --timeout=10m
+
+	# The Application syncs with selfHeal, so from here on git decides
+	# what runs. On the dev cluster that fights `make image`; the intended
+	# home for this is the second cluster (`make gitops-up`).
+	if [[ "$CLUSTER" == "weather" ]]; then
+		log "WARNING: Argo CD on the dev cluster will revert 'make image'"
+		echo "    selfHeal reverts anything that is not in git, including a"
+		echo "    locally built weather:dev. Use 'make gitops-up' instead to"
+		echo "    run the GitOps track on its own cluster."
+	fi
+
+	log "registering the weather Application"
+	# Project first, explicitly. `kubectl apply -f <dir>` walks the
+	# directory alphabetically, so application.yaml would be applied
+	# before project.yaml and Argo CD would reject the Application with
+	# "Application referencing project weather which does not exist"
+	# until the next sync. Same order as `make gitops`.
+	kubectl apply -f gitops/argocd/project.yaml
+	kubectl apply -f gitops/argocd/application.yaml
+
+	echo
+	echo "Argo CD UI:  kubectl -n argocd port-forward svc/argocd-server 8081:443"
+	echo "admin password: make argocd-password"
+}
+
+summary() {
+	log "done"
+	kubectl -n "$NAMESPACE" get pods
+
+	# These URLs are only right for the default cluster. Another cluster
+	# (CLUSTER=weather-gitops) has its own host port mappings, and
+	# values-gitops.yaml turns Grafana and Prometheus off - so printing
+	# this list there would send you to four ports, two of which nothing
+	# is listening on.
+	if [[ "$CLUSTER" == "weather" ]]; then
+		cat <<'EOS'
+
+Open:
+  UI          http://localhost:8080
+  Grafana     http://localhost:3000    (admin / devpassword)
+  Prometheus  http://localhost:9090
+  RabbitMQ    http://localhost:15672   (admin / devpassword)
+EOS
+	else
+		echo
+		echo "Cluster '$CLUSTER' uses its own host ports and values file."
+		echo "Run 'make gitops-urls' for what to open."
+	fi
+}
+
+main() {
+	require docker kind kubectl helm
+
+	create_cluster
+
+	# Was the release already there? Decides whether a restart is needed.
+	# This has to come after create_cluster, which is what points kubectl
+	# and helm at "$CLUSTER": with the GitOps cluster as the current
+	# context, the answer would be about the wrong cluster and the
+	# stale-image restart below would be skipped.
+	local existed=no
+	if helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
+		existed=yes
+	fi
+
+	build_and_load
+	deploy
+	if [[ "$existed" == "yes" ]]; then
+		restart_app
+	fi
+	if [[ "${1:-}" == "--argocd" ]]; then
+		install_argocd
+	fi
+	summary
+}
+
+main "$@"
+KINDGEN_EOF
+
+echo '  kind/cluster-gitops.yaml'
+cat > kind/cluster-gitops.yaml <<'KINDGEN_EOF'
+# Second kind cluster: the GitOps / Argo CD track.
+#
+# Why a separate cluster at all: the Argo CD Application syncs with
+# selfHeal enabled, which means it actively reverts anything that does
+# not match git. On the dev cluster that would undo `make image` a few
+# seconds after you run it. So the two workflows get one cluster each:
+#
+#   weather          `make up`   - local weather:dev image, you edit it
+#   weather-gitops   `make gitops-up` - GHCR image by digest, git decides
+#
+# Host ports differ from the dev cluster's so both can run at the same
+# time. A port that is already taken makes `kind create cluster` fail
+# outright, which is why they cannot overlap.
+#
+#   http://localhost:8082  -> weather-api      (NodePort 30080)
+#   http://localhost:3001  -> grafana          (NodePort 30300)
+#   http://localhost:9091  -> prometheus       (NodePort 30900)
+#   http://localhost:15673 -> rabbitmq mgmt    (NodePort 31567)
+#
+# The api is on 8082, not 8081, because 8081 is where `make argocd-ui`
+# port-forwards the Argo CD UI. Two things on one host port is the same
+# failure as two clusters on one host port.
+#
+# Grafana and Prometheus are disabled in values-gitops.yaml, so 3001 and
+# 9091 currently map to NodePorts nothing listens on. That is deliberate:
+# kind cannot add port mappings to a cluster that already exists, so
+# keeping them means flipping prometheus.enabled or grafana.enabled to
+# true needs no cluster rebuild. The cost is two held host ports.
+#
+# One control-plane and no workers, unlike kind/cluster.yaml: this
+# cluster exists to watch Argo CD reconcile, not to study scheduling,
+# and Argo CD itself needs ~400Mi on top of the stack. On an 8GB laptop
+# run one cluster at a time - `docker stop`/`docker start` the node
+# container keeps its volumes, which is much cheaper than recreating.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: weather-gitops
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8082
+        protocol: TCP
+      - containerPort: 30300
+        hostPort: 3001
+        protocol: TCP
+      - containerPort: 30900
+        hostPort: 9091
+        protocol: TCP
+      - containerPort: 31567
+        hostPort: 15673
+        protocol: TCP
+KINDGEN_EOF
+
+echo '  kind/cluster.yaml'
+cat > kind/cluster.yaml <<'KINDGEN_EOF'
+# Kind cluster for the weather stack.
+#
+# One control-plane + two workers, so scheduling, node affinity and
+# rollouts behave like a real (small) cluster instead of a single box.
+#
+# extraPortMappings publish the NodePorts the Helm chart creates onto
+# localhost, so no ingress controller is required to click around the UIs:
+#
+#   http://localhost:8080  -> weather-api      (NodePort 30080)
+#   http://localhost:3000  -> grafana          (NodePort 30300)
+#   http://localhost:9090  -> prometheus       (NodePort 30900)
+#   http://localhost:15672 -> rabbitmq mgmt    (NodePort 31567)
+#
+# Ports 80/443 are deliberately NOT mapped: on a normal Ubuntu box
+# something is often already listening there, and a busy host port makes
+# `kind create cluster` fail outright. If you later install an ingress
+# controller and set ingress.enabled=true, add them here and recreate
+# the cluster:
+#
+#   - containerPort: 80
+#     hostPort: 80
+#     protocol: TCP
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: weather
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+    kubeadmConfigPatches:
+      # Label the node so an ingress controller (if you add one) can be
+      # pinned here with a nodeSelector.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP
+      - containerPort: 30900
+        hostPort: 9090
+        protocol: TCP
+      - containerPort: 31567
+        hostPort: 15672
+        protocol: TCP
+
+  - role: worker
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0
+KINDGEN_EOF
+
+# ---- Argo CD GitOps track ------------------------------------------
+echo '  gitops/README.md'
+cat > gitops/README.md <<'KINDGEN_EOF'
 # GitOps track (Argo CD)
 
 `make up` is the fast path: build, load, `helm upgrade`. This folder is the
@@ -5043,7 +5175,8 @@ no release to test. The chart's smoke pod also carries
 `make gitops-status` and `http://localhost:8082` to check this cluster.
 KINDGEN_EOF
 
-cat > "gitops/argocd/application.yaml" <<'KINDGEN_EOF'
+echo '  gitops/argocd/application.yaml'
+cat > gitops/argocd/application.yaml <<'KINDGEN_EOF'
 # The GitOps entry point: Argo CD watches this repo and keeps the cluster
 # matching charts/weather.
 #
@@ -5092,7 +5225,8 @@ spec:
   revisionHistoryLimit: 5
 KINDGEN_EOF
 
-cat > "gitops/argocd/project.yaml" <<'KINDGEN_EOF'
+echo '  gitops/argocd/project.yaml'
+cat > gitops/argocd/project.yaml <<'KINDGEN_EOF'
 # A dedicated AppProject instead of using "default": it scopes what the
 # weather Application is allowed to touch, which is the whole point of
 # having projects at all.
@@ -5122,283 +5256,240 @@ spec:
       kind: "*"
 KINDGEN_EOF
 
-cat > "kind/bootstrap.sh" <<'KINDGEN_EOF'
-#!/usr/bin/env bash
-# Bring the whole stack up on a fresh kind cluster, in one command.
-#
-#   ./kind/bootstrap.sh          # cluster + image + helm release
-#   ./kind/bootstrap.sh --argocd # ... plus Argo CD and the GitOps app
-#
-# Every step is idempotent: run it again after a change and it does the
-# right thing instead of complaining.
-set -euo pipefail
+# ---- CI ------------------------------------------------------------
+echo '  .github/workflows/ci.yml'
+cat > .github/workflows/ci.yml <<'KINDGEN_EOF'
+name: CI
 
-CLUSTER="${CLUSTER:-weather}"
-NAMESPACE="${NAMESPACE:-weather}"
-RELEASE="${RELEASE:-weather}"
-IMAGE="${IMAGE:-weather:dev}"
-ARGOCD_VERSION="${ARGOCD_VERSION:-v3.5.2}"
-# Overridable so the same script can bring up the GitOps cluster, which
-# has its own host ports and its own values file.
-CLUSTER_CONFIG="${CLUSTER_CONFIG:-kind/cluster.yaml}"
-VALUES="${VALUES:-charts/weather/values-kind.yaml}"
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
-# Run from the project root no matter where the script is called from.
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Must match go.mod and app/Dockerfile. A CI runner on an older
+  # toolchain than the module requires fails on the very first run.
+  GO_VERSION: "1.26"
 
-log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+jobs:
+  # ---- 1. the Go code -------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install protoc and plugins
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate gRPC stubs
+        run: |
+          protoc --go_out=. --go_opt=module=weather \
+                 --go-grpc_out=. --go-grpc_opt=module=weather \
+                 proto/weather.proto
+      - name: Vet and test
+        run: |
+          go mod tidy
+          go vet ./...
+          go test ./...
 
-require() {
-	for cmd in "$@"; do
-		command -v "$cmd" >/dev/null || { echo "missing required tool: $cmd" >&2; exit 1; }
-	done
-}
+  # ---- 2. the chart ---------------------------------------------------
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - name: Lint and render
+        run: |
+          helm lint charts/weather --values charts/weather/values-kind.yaml
+          helm template weather charts/weather \
+            --values charts/weather/values-kind.yaml > /dev/null
+          # values-gitops.yaml needs this more than values-kind.yaml does,
+          # not less: it is the one values file a machine writes to (the
+          # bump job seds a digest into it). Unchecked, a bad write shows
+          # up as an Argo CD ComparisonError on the cluster instead of a
+          # red check on the pull request.
+          helm lint charts/weather --values charts/weather/values-gitops.yaml
+          helm template weather charts/weather \
+            --values charts/weather/values-gitops.yaml > /dev/null
 
-create_cluster() {
-	if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
-		log "cluster '$CLUSTER' already exists, keeping it"
-	else
-		log "creating kind cluster '$CLUSTER'"
-		kind create cluster --name "$CLUSTER" --config "$CLUSTER_CONFIG"
-	fi
-	kubectl config use-context "kind-${CLUSTER}" >/dev/null
-}
+  # ---- 3. does it actually run on Kubernetes? -------------------------
+  # A real kind cluster in CI, so a broken manifest fails here instead of
+  # on the laptop.
+  e2e:
+    needs: [test, chart]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.31.0
+          node_image: kindest/node:v1.37.0
+          cluster_name: weather-ci
+      - name: Build and load image
+        run: |
+          docker build -t weather:ci app
+          kind load docker-image weather:ci --name weather-ci
+      - name: Install chart
+        run: |
+          helm upgrade --install weather charts/weather \
+            --namespace weather --create-namespace \
+            --set image.tag=ci \
+            --set nodePorts.enabled=false \
+            --wait --timeout 10m
+      # The chart's own test hook, so CI and `make smoke` check exactly
+      # the same thing: api -> store gRPC -> Postgres, not just /healthz.
+      - name: Smoke test the release
+        run: helm test weather --namespace weather --timeout 5m
+      - name: Smoke test output
+        if: always()
+        run: kubectl -n weather logs weather-smoke || true
+      # Diagnostics only. Every line ends in `|| true`: if the cluster
+      # never came up, kubectl exits 1 here and THIS step becomes the
+      # only red one in the run, hiding the step that actually failed.
+      - name: Dump state on failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          kubectl -n weather get pods -o wide || true
+          kubectl -n weather describe pods || true
+          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100 || true
+          kubectl get nodes -o wide || true
 
-build_and_load() {
-	log "building $IMAGE"
-	docker build -t "$IMAGE" app
+  # ---- 4. publish -----------------------------------------------------
+  build-and-push:
+    needs: e2e
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    # Passed to the bump job below. This is the digest of what was
+    # actually pushed - the one thing a tag cannot be trusted to tell you.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-	# kind nodes have their own containerd, so a locally built image has to
-	# be copied in. This is why the chart uses pullPolicy: IfNotPresent -
-	# there is no registry to pull weather:dev from.
-	log "loading $IMAGE into the cluster"
-	kind load docker-image "$IMAGE" --name "$CLUSTER"
-}
+  # ---- 5. hand the new image to GitOps --------------------------------
+  # Argo CD deploys what git says, and git does not change when a new
+  # image is pushed - so something has to write the new reference back.
+  # That is this job. It opens a pull request instead of pushing to main:
+  # you get a diff to approve, branch protection still applies, and CI
+  # does not trigger itself in a loop.
+  #
+  # Requires: Settings -> Actions -> General -> "Allow GitHub Actions to
+  # create and approve pull requests". Without it this job fails with a
+  # 403 and nothing else explains why.
+  bump:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin the digest that was just pushed
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          test -n "$DIGEST" || { echo "build-and-push produced no digest" >&2; exit 1; }
+          sed -i -E "s|^(  digest: ).*|\1\"$DIGEST\"|" charts/weather/values-gitops.yaml
+          grep -n '  digest:' charts/weather/values-gitops.yaml
+      # Prove the edit produced a chart that still renders, and that the
+      # digest actually reached the pod spec, before asking anyone to merge.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - name: Check the chart renders with the new digest
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          helm template weather charts/weather \
+            --values charts/weather/values-gitops.yaml \
+            | grep -qF "@$DIGEST" \
+            || { echo "rendered manifests do not reference $DIGEST" >&2; exit 1; }
+      # No change means the image content did not change (the digest is
+      # content-addressed, so a docs-only commit rebuilds to the same
+      # digest). In that case this action does nothing at all, which is
+      # what stops the merge -> build -> bump loop.
+      - name: Open the deploy pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deploy/image-digest
+          delete-branch: true
+          commit-message: "deploy: pin image ${{ needs.build-and-push.outputs.digest }}"
+          title: "deploy: pin image digest"
+          labels: deploy
+          body: |
+            CI built and pushed a new image. Merging this pull request is
+            what deploys it: Argo CD syncs `charts/weather` on the
+            `weather-gitops` cluster and rolls the three app deployments.
 
-deploy() {
-	log "installing helm release '$RELEASE'"
-	helm upgrade --install "$RELEASE" charts/weather \
-		--namespace "$NAMESPACE" --create-namespace \
-		--values "$VALUES" \
-		--wait --timeout 10m
-}
+            - digest: `${{ needs.build-and-push.outputs.digest }}`
+            - commit: ${{ github.sha }}
 
-# On a re-run nothing in the chart has changed, so helm makes no changes
-# and the pods keep running the OLD image - even though a new weather:dev
-# was just loaded. Restarting the three app deployments is what makes
-# `./kind/bootstrap.sh` pick up code changes.
-restart_app() {
-	log "restarting app pods so they pick up the new image"
-	kubectl -n "$NAMESPACE" rollout restart \
-		"deploy/${RELEASE}-api" "deploy/${RELEASE}-store" "deploy/${RELEASE}-consumer"
-	kubectl -n "$NAMESPACE" rollout status "deploy/${RELEASE}-api" --timeout=5m
-}
+            The digest is immutable, so what gets deployed is exactly
+            what the checks above passed on.
+KINDGEN_EOF
 
-install_argocd() {
-	log "installing Argo CD $ARGOCD_VERSION"
-	kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-	kubectl apply -n argocd \
-		-f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
+# ---- finish ----------------------------------------------------------
+chmod +x kind/bootstrap.sh
 
-	log "waiting for Argo CD to become ready"
-	kubectl -n argocd rollout status deploy/argocd-server --timeout=10m
+cat <<'EOS'
 
-	# The Application syncs with selfHeal, so from here on git decides
-	# what runs. On the dev cluster that fights `make image`; the intended
-	# home for this is the second cluster (`make gitops-up`).
-	if [[ "$CLUSTER" == "weather" ]]; then
-		log "WARNING: Argo CD on the dev cluster will revert 'make image'"
-		echo "    selfHeal reverts anything that is not in git, including a"
-		echo "    locally built weather:dev. Use 'make gitops-up' instead to"
-		echo "    run the GitOps track on its own cluster."
-	fi
+Done. Next:
 
-	log "registering the weather Application"
-	# Project first, explicitly. `kubectl apply -f <dir>` walks the
-	# directory alphabetically, so application.yaml would be applied
-	# before project.yaml and Argo CD would reject the Application with
-	# "Application referencing project weather which does not exist"
-	# until the next sync. Same order as `make gitops`.
-	kubectl apply -f gitops/argocd/project.yaml
-	kubectl apply -f gitops/argocd/application.yaml
+  cd "$ROOT"
+  ./kind/bootstrap.sh          # cluster + image + helm release
+  open http://localhost:8080
 
-	echo
-	echo "Argo CD UI:  kubectl -n argocd port-forward svc/argocd-server 8081:443"
-	echo "admin password: make argocd-password"
-}
+Optional GitOps track:
 
-summary() {
-	log "done"
-	kubectl -n "$NAMESPACE" get pods
+  make argocd
+  make gitops REPO_URL=https://github.com/<you>/weather-kind.git
 
-	# These URLs are only right for the default cluster. Another cluster
-	# (CLUSTER=weather-gitops) has its own host port mappings, and
-	# values-gitops.yaml turns Grafana and Prometheus off - so printing
-	# this list there would send you to four ports, two of which nothing
-	# is listening on.
-	if [[ "$CLUSTER" == "weather" ]]; then
-		cat <<'EOS'
-
-Open:
-  UI          http://localhost:8080
-  Grafana     http://localhost:3000    (admin / devpassword)
-  Prometheus  http://localhost:9090
-  RabbitMQ    http://localhost:15672   (admin / devpassword)
+Requires docker, kind, kubectl and helm on PATH.
 EOS
-	else
-		echo
-		echo "Cluster '$CLUSTER' uses its own host ports and values file."
-		echo "Run 'make gitops-urls' for what to open."
-	fi
-}
-
-main() {
-	require docker kind kubectl helm
-
-	create_cluster
-
-	# Was the release already there? Decides whether a restart is needed.
-	# This has to come after create_cluster, which is what points kubectl
-	# and helm at "$CLUSTER": with the GitOps cluster as the current
-	# context, the answer would be about the wrong cluster and the
-	# stale-image restart below would be skipped.
-	local existed=no
-	if helm status "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1; then
-		existed=yes
-	fi
-
-	build_and_load
-	deploy
-	if [[ "$existed" == "yes" ]]; then
-		restart_app
-	fi
-	if [[ "${1:-}" == "--argocd" ]]; then
-		install_argocd
-	fi
-	summary
-}
-
-main "$@"
-KINDGEN_EOF
-
-cat > "kind/cluster-gitops.yaml" <<'KINDGEN_EOF'
-# Second kind cluster: the GitOps / Argo CD track.
-#
-# Why a separate cluster at all: the Argo CD Application syncs with
-# selfHeal enabled, which means it actively reverts anything that does
-# not match git. On the dev cluster that would undo `make image` a few
-# seconds after you run it. So the two workflows get one cluster each:
-#
-#   weather          `make up`   - local weather:dev image, you edit it
-#   weather-gitops   `make gitops-up` - GHCR image by digest, git decides
-#
-# Host ports differ from the dev cluster's so both can run at the same
-# time. A port that is already taken makes `kind create cluster` fail
-# outright, which is why they cannot overlap.
-#
-#   http://localhost:8082  -> weather-api      (NodePort 30080)
-#   http://localhost:3001  -> grafana          (NodePort 30300)
-#   http://localhost:9091  -> prometheus       (NodePort 30900)
-#   http://localhost:15673 -> rabbitmq mgmt    (NodePort 31567)
-#
-# The api is on 8082, not 8081, because 8081 is where `make argocd-ui`
-# port-forwards the Argo CD UI. Two things on one host port is the same
-# failure as two clusters on one host port.
-#
-# Grafana and Prometheus are disabled in values-gitops.yaml, so 3001 and
-# 9091 currently map to NodePorts nothing listens on. That is deliberate:
-# kind cannot add port mappings to a cluster that already exists, so
-# keeping them means flipping prometheus.enabled or grafana.enabled to
-# true needs no cluster rebuild. The cost is two held host ports.
-#
-# One control-plane and no workers, unlike kind/cluster.yaml: this
-# cluster exists to watch Argo CD reconcile, not to study scheduling,
-# and Argo CD itself needs ~400Mi on top of the stack. On an 8GB laptop
-# run one cluster at a time - `docker stop`/`docker start` the node
-# container keeps its volumes, which is much cheaper than recreating.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: weather-gitops
-
-nodes:
-  - role: control-plane
-    image: kindest/node:v1.37.0
-    extraPortMappings:
-      - containerPort: 30080
-        hostPort: 8082
-        protocol: TCP
-      - containerPort: 30300
-        hostPort: 3001
-        protocol: TCP
-      - containerPort: 30900
-        hostPort: 9091
-        protocol: TCP
-      - containerPort: 31567
-        hostPort: 15673
-        protocol: TCP
-KINDGEN_EOF
-
-cat > "kind/cluster.yaml" <<'KINDGEN_EOF'
-# Kind cluster for the weather stack.
-#
-# One control-plane + two workers, so scheduling, node affinity and
-# rollouts behave like a real (small) cluster instead of a single box.
-#
-# extraPortMappings publish the NodePorts the Helm chart creates onto
-# localhost, so no ingress controller is required to click around the UIs:
-#
-#   http://localhost:8080  -> weather-api      (NodePort 30080)
-#   http://localhost:3000  -> grafana          (NodePort 30300)
-#   http://localhost:9090  -> prometheus       (NodePort 30900)
-#   http://localhost:15672 -> rabbitmq mgmt    (NodePort 31567)
-#
-# Ports 80/443 are deliberately NOT mapped: on a normal Ubuntu box
-# something is often already listening there, and a busy host port makes
-# `kind create cluster` fail outright. If you later install an ingress
-# controller and set ingress.enabled=true, add them here and recreate
-# the cluster:
-#
-#   - containerPort: 80
-#     hostPort: 80
-#     protocol: TCP
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: weather
-
-nodes:
-  - role: control-plane
-    image: kindest/node:v1.37.0
-    kubeadmConfigPatches:
-      # Label the node so an ingress controller (if you add one) can be
-      # pinned here with a nodeSelector.
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
-    extraPortMappings:
-      - containerPort: 30080
-        hostPort: 8080
-        protocol: TCP
-      - containerPort: 30300
-        hostPort: 3000
-        protocol: TCP
-      - containerPort: 30900
-        hostPort: 9090
-        protocol: TCP
-      - containerPort: 31567
-        hostPort: 15672
-        protocol: TCP
-
-  - role: worker
-    image: kindest/node:v1.37.0
-  - role: worker
-    image: kindest/node:v1.37.0
-KINDGEN_EOF
-
-chmod +x "generate.sh" 2>/dev/null || true
-chmod +x "kind/bootstrap.sh" 2>/dev/null || true
-
-echo "weather-kind generated in $TARGET"
-echo "next: cd $TARGET && make up"

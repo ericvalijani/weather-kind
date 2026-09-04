@@ -600,39 +600,31 @@ DeadlineExceeded` once or twice at startup. It is publishing before store has
 finished connecting to Postgres; RabbitMQ redelivers and the reading lands a few
 seconds later. Consistent with the log showing `stored id=1` right after.
 
-### 10.14 Two more from the first real run
+### 10.15 Argo CD will not install with a plain kubectl apply
 
-**A passing smoke test reported failure.** `helm test` printed `Phase:
-Succeeded` and then `make smoke` exited 1 with `unable to get pod logs for
-weather-smoke: pods "weather-smoke" not found`. Two of my own changes
-collided: `--logs` (added so a failing test shows its output) and
-`helm.sh/hook-delete-policy: ...,hook-succeeded` (which deletes the pod the
-instant it passes). Helm deleted the pod, then went looking for its logs.
-Fix: drop `hook-succeeded`. `before-hook-creation` still guarantees one pod at
-a time, and the pod that stays behind is exactly what `--logs` needs. Second
-time in three passes that the test harness, not the app, was the liar.
+`make gitops-up` got as far as the Argo CD manifest and stopped:
 
-**CI's e2e job never got a cluster.** Not our chart, not our image - kind
-itself:
+    networkpolicy.networking.k8s.io/argocd-server-network-policy unchanged
+    The CustomResourceDefinition "applicationsets.argoproj.io" is invalid:
+    metadata.annotations: Too long: may not be more than 262144 bytes
+    make[1]: *** [Makefile:199: argocd] Error 1
 
-    x Starting control-plane
-    ERROR: failed to create cluster: failed to init node with kubeadm
-    error: your configuration file uses an old API spec: "kubeadm.k8s.io/v1beta3"
+Client-side `kubectl apply` keeps a full copy of every object it applies in
+that object's `kubectl.kubernetes.io/last-applied-configuration` annotation,
+so it can compute a three-way diff next time. Annotations are limited to
+262144 bytes. Argo CD's ApplicationSet CRD, with its complete OpenAPI schema
+inlined, is larger than the limit on its own - so the annotation the apply
+must write is rejected, and no amount of retrying helps. Note the earlier
+lines said `unchanged` and `created`: the install is partly done when it dies,
+which is why the fix has to be re-runnable rather than starting clean.
 
-kind generates the kubeadm config and chooses its API version from the target
-Kubernetes release - v1beta3 through 1.35.x, v1beta4 from 1.36.0 - and v1beta4
-support landed after kind v0.31.0. Kubernetes 1.37 removed v1beta3. So the
-workflow's `version: v0.31.0` and `node_image: kindest/node:v1.37.0` were
-mutually exclusive, while the same node image worked locally because the local
-kind is newer. CI now pins v0.33.0, and README's Versions section states the
-pairing.
+`kubectl apply --server-side` moves the bookkeeping to `managedFields` on the
+object, tracked per field by the API server, with no annotation and no size
+ceiling. `--force-conflicts` is what makes a second run work: fields already
+owned by the earlier client-side apply are taken over instead of reported as
+conflicts. Both `make argocd` and `kind/bootstrap.sh` now apply this way.
 
-What this cost, and the lesson: eleven static passes could not have found it.
-`helm lint`, `helm template`, YAML and JSON validation, cross-file grep - all
-pass, because nothing in any file is malformed. The incompatibility exists only
-between a binary version and an image version, and only surfaces when something
-really calls `kubeadm init`. Two independently correct pins, wrong together.
-This is what `renovate.json`'s custom managers are for: one watches `version:`
-under `helm/kind-action`, another watches `kindest/node` in both
-`kind/cluster.yaml` and `ci.yml`, so the pair moves together instead of
-drifting apart.
+Worth knowing generally: this is a property of the Argo CD manifest's size,
+not of kind or of this project, and it affects the upstream install
+instructions the same way on any cluster. Argo CD's own docs recommend
+server-side apply for exactly this reason.
