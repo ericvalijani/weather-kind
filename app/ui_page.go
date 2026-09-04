@@ -156,7 +156,7 @@ const weatherUIHTML = `<!DOCTYPE html>
 <body>
   <div class="card">
     <h1>Weather stack</h1>
-    <p class="sub">Search a city, or add a new one to start tracking it</p>
+    <p class="sub">Search a Test city, or add a new one to start tracking it</p>
 
     <div class="search-wrap">
       <div class="search-box">
