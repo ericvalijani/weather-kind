@@ -599,3 +599,40 @@ Benign, for reference: the consumer logs `addReading: rpc error: code =
 DeadlineExceeded` once or twice at startup. It is publishing before store has
 finished connecting to Postgres; RabbitMQ redelivers and the reading lands a few
 seconds later. Consistent with the log showing `stored id=1` right after.
+
+### 10.14 Two more from the first real run
+
+**A passing smoke test reported failure.** `helm test` printed `Phase:
+Succeeded` and then `make smoke` exited 1 with `unable to get pod logs for
+weather-smoke: pods "weather-smoke" not found`. Two of my own changes
+collided: `--logs` (added so a failing test shows its output) and
+`helm.sh/hook-delete-policy: ...,hook-succeeded` (which deletes the pod the
+instant it passes). Helm deleted the pod, then went looking for its logs.
+Fix: drop `hook-succeeded`. `before-hook-creation` still guarantees one pod at
+a time, and the pod that stays behind is exactly what `--logs` needs. Second
+time in three passes that the test harness, not the app, was the liar.
+
+**CI's e2e job never got a cluster.** Not our chart, not our image - kind
+itself:
+
+    x Starting control-plane
+    ERROR: failed to create cluster: failed to init node with kubeadm
+    error: your configuration file uses an old API spec: "kubeadm.k8s.io/v1beta3"
+
+kind generates the kubeadm config and chooses its API version from the target
+Kubernetes release - v1beta3 through 1.35.x, v1beta4 from 1.36.0 - and v1beta4
+support landed after kind v0.31.0. Kubernetes 1.37 removed v1beta3. So the
+workflow's `version: v0.31.0` and `node_image: kindest/node:v1.37.0` were
+mutually exclusive, while the same node image worked locally because the local
+kind is newer. CI now pins v0.33.0, and README's Versions section states the
+pairing.
+
+What this cost, and the lesson: eleven static passes could not have found it.
+`helm lint`, `helm template`, YAML and JSON validation, cross-file grep - all
+pass, because nothing in any file is malformed. The incompatibility exists only
+between a binary version and an image version, and only surfaces when something
+really calls `kubeadm init`. Two independently correct pins, wrong together.
+This is what `renovate.json`'s custom managers are for: one watches `version:`
+under `helm/kind-action`, another watches `kindest/node` in both
+`kind/cluster.yaml` and `ci.yml`, so the pair moves together instead of
+drifting apart.

@@ -209,6 +209,13 @@ kind node v1.37.0, Helm >= 4.2.4 (Helm 3.21.x still works, security
 fixes until Nov 2026), Argo CD v3.5.2, Go 1.26 (matching `go.mod`).
 Re-check before bumping — see PROMPT.md for the version policy.
 
+One pairing to respect: the **kind CLI must be v0.32.0 or newer** for
+the v1.37.0 node image. kind writes the kubeadm config, and only
+v0.32+ writes the v1beta4 format that Kubernetes 1.37 accepts - older
+kind fails at `kubeadm init` with `old API spec: kubeadm.k8s.io/v1beta3`
+before the control plane ever starts. Check with `kind version`. CI
+pins v0.33.0 in `.github/workflows/ci.yml` for the same reason.
+
 ## GitOps track (optional, second cluster)
 
 The default workflow above is imperative: you run `make image`, Helm changes the
