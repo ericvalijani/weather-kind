@@ -57,8 +57,14 @@ spec:
 
           # An empty list means api reached store but the seed never
           # landed - a real failure, and invisible to /healthz.
+          #
+          # Match "Name", capitalised: cityCoord in city_cache.go has no
+          # json tags, so encoding/json uses the Go field names verbatim.
+          # Grepping for lowercase "name" failed against a perfectly
+          # healthy release - the endpoint answered with five cities and
+          # this test still called it empty.
           case "$cities" in
-            *'"name"'*) echo "smoke test ok" ;;
+            *'"Name"'*) echo "smoke test ok" ;;
             *) echo "no cities returned" >&2; exit 1 ;;
           esac
       resources:

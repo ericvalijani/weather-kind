@@ -562,3 +562,40 @@ the first is the wrong cluster's and two are components `values-gitops.yaml`
 switches off. It now prints that list only for the default cluster and points
 anywhere else at `make gitops-urls`. Same bug that was in `NOTES.txt`; this
 copy was missed because the script hardcodes what the chart templates.
+
+### 10.13 Three bugs the first real run found
+
+Eight static review passes did not catch any of these. All three needed a
+machine with docker, kind, helm and a GitHub repo attached.
+
+**`make smoke` failed against a perfectly healthy release.** The pod fetched
+`/cities`, got five cities back, printed them, and then said `no cities
+returned` and exited 1. The test grepped for `"name"`; `cityCoord` in
+`city_cache.go` carries no json tags, so `encoding/json` emits the Go field
+names - `"Name"`, `"Lat"`, `"Lon"`. The assertion, not the app, was wrong. Note
+which way this failure points: a test that says "broken" about something that
+works costs more than no test, because the next person debugs the wrong end.
+The pattern now matches `"Name"`. If json tags are ever added to `cityCoord`,
+this line has to change with them.
+
+**`make test` reported `proto/weather.proto: No such file or directory`.** The
+file is there. The target mounted `$(PWD)/app`, and `PWD` comes from the shell,
+so it can be a logical path - a symlinked directory, an automounted home. Docker
+resolves the mount source on the host and, when it does not exist, *creates an
+empty directory* rather than failing. So the mount succeeded, `/src` was empty,
+`go install` still worked (network, not disk), and the first thing to touch a
+repo file - protoc - reported a missing proto. It now uses `$(CURDIR)`, which
+make computes itself, and checks `app/proto/weather.proto` exists before
+starting the container.
+
+**CI's failure diagnostics became the failure.** The e2e job's `Dump state on
+failure` step ran `kubectl` with no `|| true`. When the cluster is not up,
+kubectl exits 1, so that step turned red - and it was the only red step, with
+`The connection to the server localhost:8080 was refused` as the entire visible
+cause. Every line now ends in `|| true` and the step is `continue-on-error`, so
+the step that actually broke stays the red one.
+
+Benign, for reference: the consumer logs `addReading: rpc error: code =
+DeadlineExceeded` once or twice at startup. It is publishing before store has
+finished connecting to Postgres; RabbitMQ redelivers and the reading lands a few
+seconds later. Consistent with the log showing `stored id=1` right after.

@@ -641,6 +641,43 @@ the first is the wrong cluster's and two are components `values-gitops.yaml`
 switches off. It now prints that list only for the default cluster and points
 anywhere else at `make gitops-urls`. Same bug that was in `NOTES.txt`; this
 copy was missed because the script hardcodes what the chart templates.
+
+### 10.13 Three bugs the first real run found
+
+Eight static review passes did not catch any of these. All three needed a
+machine with docker, kind, helm and a GitHub repo attached.
+
+**`make smoke` failed against a perfectly healthy release.** The pod fetched
+`/cities`, got five cities back, printed them, and then said `no cities
+returned` and exited 1. The test grepped for `"name"`; `cityCoord` in
+`city_cache.go` carries no json tags, so `encoding/json` emits the Go field
+names - `"Name"`, `"Lat"`, `"Lon"`. The assertion, not the app, was wrong. Note
+which way this failure points: a test that says "broken" about something that
+works costs more than no test, because the next person debugs the wrong end.
+The pattern now matches `"Name"`. If json tags are ever added to `cityCoord`,
+this line has to change with them.
+
+**`make test` reported `proto/weather.proto: No such file or directory`.** The
+file is there. The target mounted `$(PWD)/app`, and `PWD` comes from the shell,
+so it can be a logical path - a symlinked directory, an automounted home. Docker
+resolves the mount source on the host and, when it does not exist, *creates an
+empty directory* rather than failing. So the mount succeeded, `/src` was empty,
+`go install` still worked (network, not disk), and the first thing to touch a
+repo file - protoc - reported a missing proto. It now uses `$(CURDIR)`, which
+make computes itself, and checks `app/proto/weather.proto` exists before
+starting the container.
+
+**CI's failure diagnostics became the failure.** The e2e job's `Dump state on
+failure` step ran `kubectl` with no `|| true`. When the cluster is not up,
+kubectl exits 1, so that step turned red - and it was the only red step, with
+`The connection to the server localhost:8080 was refused` as the entire visible
+cause. Every line now ends in `|| true` and the step is `continue-on-error`, so
+the step that actually broke stays the red one.
+
+Benign, for reference: the consumer logs `addReading: rpc error: code =
+DeadlineExceeded` once or twice at startup. It is publishing before store has
+finished connecting to Postgres; RabbitMQ redelivers and the reading lands a few
+seconds later. Consistent with the log showing `stored id=1` right after.
 KINDGEN_EOF
 
 echo '  Makefile'
@@ -785,8 +822,18 @@ smoke:
 # exactly like the Docker build does.
 # --user keeps generated files (go.sum, genproto/) owned by you instead
 # of root; HOME and GOCACHE must then point somewhere writable.
+#
+# $(CURDIR), not $(PWD): make computes CURDIR itself, while PWD is
+# inherited from the shell and can be a logical path (a symlinked
+# directory, an automounted home). Docker resolves the mount source on
+# the host and silently CREATES AN EMPTY DIRECTORY when it does not
+# exist - so a wrong path does not fail, it mounts nothing, and the
+# first symptom is protoc reporting that proto/weather.proto is
+# missing. The guard above turns that into a clear message.
 test:
-	docker run --rm -v "$(PWD)/app:/src" -w /src \
+	@test -f app/proto/weather.proto \
+	  || { echo "app/proto/weather.proto not found - run make from the repo root"; exit 1; }
+	docker run --rm -v "$(CURDIR)/app:/src" -w /src \
 		--user "$(shell id -u):$(shell id -g)" \
 		-e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOPATH=/tmp/go \
 		$(GO_IMAGE) sh -c '\
@@ -1309,29 +1356,31 @@ HANDOFF.md               what was built, what broke, what to watch
 ## Commands
 
 ```bash
-make help          # list everything
-make up            # same as ./kind/bootstrap.sh
-make image         # rebuild Go image, load into cluster, restart pods
-make deploy        # helm upgrade --install
-make status        # pods, services, pvcs
-make logs          # follow all three weather pods
-make test          # go vet + go test (protoc runs in the container)
-make template      # render the chart without a cluster
-make lint          # helm lint
-make psql          # psql inside the postgres pod
-make smoke         # helm test: does the running release actually answer?
-make down          # delete the cluster
+make help          # every target with a one-line description
+make up            # create the cluster, build+load the image, install the chart (idempotent, safe to re-run)
+make image         # after editing Go: rebuild weather:dev, kind load it, restart api/store/consumer only
+make deploy        # after editing the chart: helm upgrade --install, no image rebuild
+make status        # pods, services and PVCs in one screen - the first thing to run when something looks wrong
+make logs          # tail api, store and consumer together, prefixed by pod, to watch fetch -> publish -> store
+make test          # go vet + go test in a golang container, so protoc and the gRPC stubs need nothing installed locally
+make template      # render the chart to stdout without touching a cluster - what Helm would actually send
+make lint          # helm lint: chart structure and values, not whether the manifests are valid Kubernetes
+make psql          # interactive psql inside the postgres pod, already connected to the weather database
+make smoke         # helm test: hits api /healthz, store /healthz, then api /cities - proves the gRPC path works end to end
+make clean         # uninstall the release and delete the namespace, keeping the cluster (PVCs go too)
+make down          # delete the whole kind cluster, including its images and volumes
 ```
 
 And for the optional GitOps cluster:
 
 ```bash
-make gitops-up     # create cluster 2, install Argo CD, register the app
-make gitops-status # sync state, health, live revision
-make gitops-urls   # what to open
-make argocd-ui     # port-forward the Argo CD UI to :8081
-make argocd-password
-make gitops-down   # delete cluster 2
+make gitops-up       # create the weather-gitops cluster, install Argo CD, register the Application - the one entry point
+make gitops-status   # is it Synced and Healthy, and which git revision is actually live?
+make gitops-urls     # host ports for cluster 2 (8082/15673 - Grafana and Prometheus are off there)
+make argocd-ui       # port-forward the Argo CD UI to https://localhost:8081 (leave it running)
+make argocd-password # the generated admin password, for the UI above
+make gitops         # point the Application at your fork: make gitops REPO_URL=...
+make gitops-down    # delete cluster 2 and leave the dev cluster alone
 ```
 
 `make template` and `make lint` use the dev values. To check what Argo CD
@@ -4490,8 +4539,14 @@ spec:
 
           # An empty list means api reached store but the seed never
           # landed - a real failure, and invisible to /healthz.
+          #
+          # Match "Name", capitalised: cityCoord in city_cache.go has no
+          # json tags, so encoding/json uses the Go field names verbatim.
+          # Grepping for lowercase "name" failed against a perfectly
+          # healthy release - the endpoint answered with five cities and
+          # this test still called it empty.
           case "$cities" in
-            *'"name"'*) echo "smoke test ok" ;;
+            *'"Name"'*) echo "smoke test ok" ;;
             *) echo "no cities returned" >&2; exit 1 ;;
           esac
       resources:
@@ -5261,12 +5316,17 @@ jobs:
       - name: Smoke test output
         if: always()
         run: kubectl -n weather logs weather-smoke || true
+      # Diagnostics only. Every line ends in `|| true`: if the cluster
+      # never came up, kubectl exits 1 here and THIS step becomes the
+      # only red one in the run, hiding the step that actually failed.
       - name: Dump state on failure
         if: failure()
+        continue-on-error: true
         run: |
-          kubectl -n weather get pods -o wide
-          kubectl -n weather describe pods
-          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100
+          kubectl -n weather get pods -o wide || true
+          kubectl -n weather describe pods || true
+          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100 || true
+          kubectl get nodes -o wide || true
 
   # ---- 4. publish -----------------------------------------------------
   build-and-push:

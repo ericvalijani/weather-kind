@@ -114,29 +114,31 @@ HANDOFF.md               what was built, what broke, what to watch
 ## Commands
 
 ```bash
-make help          # list everything
-make up            # same as ./kind/bootstrap.sh
-make image         # rebuild Go image, load into cluster, restart pods
-make deploy        # helm upgrade --install
-make status        # pods, services, pvcs
-make logs          # follow all three weather pods
-make test          # go vet + go test (protoc runs in the container)
-make template      # render the chart without a cluster
-make lint          # helm lint
-make psql          # psql inside the postgres pod
-make smoke         # helm test: does the running release actually answer?
-make down          # delete the cluster
+make help          # every target with a one-line description
+make up            # create the cluster, build+load the image, install the chart (idempotent, safe to re-run)
+make image         # after editing Go: rebuild weather:dev, kind load it, restart api/store/consumer only
+make deploy        # after editing the chart: helm upgrade --install, no image rebuild
+make status        # pods, services and PVCs in one screen - the first thing to run when something looks wrong
+make logs          # tail api, store and consumer together, prefixed by pod, to watch fetch -> publish -> store
+make test          # go vet + go test in a golang container, so protoc and the gRPC stubs need nothing installed locally
+make template      # render the chart to stdout without touching a cluster - what Helm would actually send
+make lint          # helm lint: chart structure and values, not whether the manifests are valid Kubernetes
+make psql          # interactive psql inside the postgres pod, already connected to the weather database
+make smoke         # helm test: hits api /healthz, store /healthz, then api /cities - proves the gRPC path works end to end
+make clean         # uninstall the release and delete the namespace, keeping the cluster (PVCs go too)
+make down          # delete the whole kind cluster, including its images and volumes
 ```
 
 And for the optional GitOps cluster:
 
 ```bash
-make gitops-up     # create cluster 2, install Argo CD, register the app
-make gitops-status # sync state, health, live revision
-make gitops-urls   # what to open
-make argocd-ui     # port-forward the Argo CD UI to :8081
-make argocd-password
-make gitops-down   # delete cluster 2
+make gitops-up       # create the weather-gitops cluster, install Argo CD, register the Application - the one entry point
+make gitops-status   # is it Synced and Healthy, and which git revision is actually live?
+make gitops-urls     # host ports for cluster 2 (8082/15673 - Grafana and Prometheus are off there)
+make argocd-ui       # port-forward the Argo CD UI to https://localhost:8081 (leave it running)
+make argocd-password # the generated admin password, for the UI above
+make gitops         # point the Application at your fork: make gitops REPO_URL=...
+make gitops-down    # delete cluster 2 and leave the dev cluster alone
 ```
 
 `make template` and `make lint` use the dev values. To check what Argo CD

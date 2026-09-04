@@ -99,12 +99,17 @@ jobs:
       - name: Smoke test output
         if: always()
         run: kubectl -n weather logs weather-smoke || true
+      # Diagnostics only. Every line ends in `|| true`: if the cluster
+      # never came up, kubectl exits 1 here and THIS step becomes the
+      # only red one in the run, hiding the step that actually failed.
       - name: Dump state on failure
         if: failure()
+        continue-on-error: true
         run: |
-          kubectl -n weather get pods -o wide
-          kubectl -n weather describe pods
-          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100
+          kubectl -n weather get pods -o wide || true
+          kubectl -n weather describe pods || true
+          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100 || true
+          kubectl get nodes -o wide || true
 
   # ---- 4. publish -----------------------------------------------------
   build-and-push:

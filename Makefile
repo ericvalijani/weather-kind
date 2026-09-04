@@ -138,8 +138,18 @@ smoke:
 # exactly like the Docker build does.
 # --user keeps generated files (go.sum, genproto/) owned by you instead
 # of root; HOME and GOCACHE must then point somewhere writable.
+#
+# $(CURDIR), not $(PWD): make computes CURDIR itself, while PWD is
+# inherited from the shell and can be a logical path (a symlinked
+# directory, an automounted home). Docker resolves the mount source on
+# the host and silently CREATES AN EMPTY DIRECTORY when it does not
+# exist - so a wrong path does not fail, it mounts nothing, and the
+# first symptom is protoc reporting that proto/weather.proto is
+# missing. The guard above turns that into a clear message.
 test:
-	docker run --rm -v "$(PWD)/app:/src" -w /src \
+	@test -f app/proto/weather.proto \
+	  || { echo "app/proto/weather.proto not found - run make from the repo root"; exit 1; }
+	docker run --rm -v "$(CURDIR)/app:/src" -w /src \
 		--user "$(shell id -u):$(shell id -g)" \
 		-e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOPATH=/tmp/go \
 		$(GO_IMAGE) sh -c '\
