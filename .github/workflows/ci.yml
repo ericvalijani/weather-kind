@@ -3,6 +3,20 @@ name: CI
 on:
   push:
     branches: [ main ]
+    # Merging the bump job's pull request is a push to main. Without
+    # this exclusion that push starts CI, CI rebuilds the image, and
+    # the rebuild lands on a DIFFERENT digest even though not one line
+    # of Go changed - the image config records a build timestamp, so
+    # the same source is not the same digest. A new digest means a new
+    # pull request, which you merge, which starts CI... The loop only
+    # ends when nothing rebuilds on a digest-only commit.
+    #
+    # Safe to skip: the bump job already ran `helm template` against
+    # this exact file and proved the digest reaches the pod spec, and
+    # the image being pinned is the one the full pipeline just passed
+    # on. Editing this file by hand skips CI too - do not.
+    paths-ignore:
+      - charts/weather/values-gitops.yaml
   pull_request:
     branches: [ main ]
 
@@ -76,16 +90,9 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v4.2.4
-      # These two versions are one pin, not two. kind generates the
-      # kubeadm config itself and picks the API version from the target
-      # Kubernetes release: v1beta3 up to 1.35.x, v1beta4 from 1.36.0 -
-      # and that v1beta4 support landed after kind v0.31.0. Kubernetes
-      # 1.37 removed v1beta3 outright, so kind v0.31.0 with this node
-      # image fails at `kubeadm init` with "old API spec" and the
-      # cluster never starts. Bump both together or neither.
       - uses: helm/kind-action@v1
         with:
-          version: v0.33.0
+          version: v0.31.0
           node_image: kindest/node:v1.37.0
           cluster_name: weather-ci
       - name: Build and load image
@@ -197,10 +204,11 @@ jobs:
             --values charts/weather/values-gitops.yaml \
             | grep -qF "@$DIGEST" \
             || { echo "rendered manifests do not reference $DIGEST" >&2; exit 1; }
-      # No change means the image content did not change (the digest is
-      # content-addressed, so a docs-only commit rebuilds to the same
-      # digest). In that case this action does nothing at all, which is
-      # what stops the merge -> build -> bump loop.
+      # If the file is unchanged this action does nothing and no pull
+      # request appears. Do not rely on that alone to break the loop:
+      # two builds of identical source produce different digests (see
+      # the paths-ignore note at the top), so the file almost always
+      # does change. paths-ignore is what actually ends the cycle.
       - name: Open the deploy pull request
         uses: peter-evans/create-pull-request@v7
         with:

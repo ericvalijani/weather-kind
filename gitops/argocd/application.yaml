@@ -42,5 +42,28 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+  # Why the two StatefulSets would otherwise sit OutOfSync forever.
+  #
+  # A StatefulSet's volumeClaimTemplates are immutable after creation:
+  # the API server rejects any update to them. It also defaults fields
+  # into them that the chart does not set - volumeMode: Filesystem, the
+  # cluster's default storageClassName, an empty status block. So Argo
+  # CD compares git (without those fields) against the live object
+  # (with them), reports a difference, tries to sync, cannot change an
+  # immutable field, and reports the difference again. Nothing is
+  # wrong with the cluster - the app stays Healthy throughout - but the
+  # status is stuck on OutOfSync and hides real drift elsewhere.
+  #
+  # Ignoring this one path is the honest fix: it is a field Argo CD
+  # could never reconcile anyway. Changing a volume's size or class
+  # still requires deleting the StatefulSet (kubectl delete sts
+  # --cascade=orphan) and letting Argo CD recreate it, exactly as it
+  # did before this block existed.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+
   # Keep a short history so rollbacks are quick but etcd stays small.
   revisionHistoryLimit: 5

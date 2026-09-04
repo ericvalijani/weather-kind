@@ -241,6 +241,17 @@ make gitops-down      # delete the second cluster
 container parks it with its volumes intact; `docker start` brings it back. That is
 much cheaper than deleting and recreating.
 
+### How often you merge a deploy pull request
+
+Once per change you actually make. A digest-only commit does not
+restart the pipeline (`paths-ignore` in `.github/workflows/ci.yml`),
+so merging one pull request does not produce the next one. If you see
+a second deploy pull request without having pushed anything, that is a
+bug, not the design.
+
+Close stale ones freely - only the newest digest matters, and the
+branch is force-pushed to the same name every time.
+
 ### How a change reaches the GitOps cluster
 
 ```

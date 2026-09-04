@@ -707,6 +707,79 @@ Worth knowing generally: this is a property of the Argo CD manifest's size,
 not of kind or of this project, and it affects the upstream install
 instructions the same way on any cluster. Argo CD's own docs recommend
 server-side apply for exactly this reason.
+
+### 10.16 The deploy pull request that would not stop
+
+Eric merged the digest pull request and got another one, having changed no
+code. Then another. The loop is structural and it is my error - a comment in
+`ci.yml` even asserted it could not happen, on the theory that identical
+source rebuilds to an identical digest.
+
+That theory is wrong. A digest is content-addressed over the image, and the
+image includes its own config blob, which records a build timestamp. Build the
+same Dockerfile from the same source twice and you get two digests. So:
+merge the pin -> push to main -> CI rebuilds -> new digest -> new pull request
+-> merge -> forever, each cycle burning a full pipeline and a GHCR layer.
+
+Fix: `paths-ignore: [charts/weather/values-gitops.yaml]` on the push trigger.
+A commit touching only the pinned digest no longer starts CI. That is safe
+precisely because the bump job has already rendered the chart with that digest
+and proved it reaches the pod spec before opening the pull request - the file
+arrives pre-validated. Now one push you make produces exactly one deploy pull
+request.
+
+The general shape is worth remembering: any job that writes to the branch that
+triggers it needs a stop condition, and "the output will be identical next
+time" is not one unless the build is genuinely reproducible. Ours is not, and
+making it so (SOURCE_DATE_EPOCH, rewrite-timestamp, no provenance
+attestations) is a much larger commitment than excluding one path.
+
+### 10.17 Two StatefulSets stuck OutOfSync while Healthy
+
+The same cluster showed `Healthy` and `OutOfSync` together, with the diff on
+`weather-postgres` and `weather-rabbitmq` only. Both are the only
+StatefulSets in the chart, which is the tell.
+
+`volumeClaimTemplates` are immutable once a StatefulSet exists. The API server
+also defaults fields into them that the chart never sets: `volumeMode:
+Filesystem`, the cluster's default `storageClassName` (the chart deliberately
+omits it so kind's default applies), and an empty `status`. Argo CD compares
+git against live, sees those fields, tries to sync, is refused because the
+field is immutable, and reports the same difference on the next pass. It
+cannot converge, and a permanently yellow app trains you to ignore the one
+signal that is supposed to mean something.
+
+Fix: `ignoreDifferences` on `/spec/volumeClaimTemplates` for `apps/StatefulSet`
+in `gitops/argocd/application.yaml`. This gives up nothing that worked before -
+Argo CD could never have applied a change there. Resizing a volume still means
+deleting the StatefulSet with `--cascade=orphan` (the PVCs and the data
+survive) and letting Argo CD recreate it.
+
+### 10.18 A fix that was written down and never applied
+
+Section 10.13 records that `helm test --logs` cannot be combined with
+`hook-delete-policy: hook-succeeded` - Helm deletes the pod on success and then
+fails to read its logs, so a passing smoke test prints
+
+```
+Phase: Succeeded
+Error: unable to get pod logs for weather-smoke: pods "weather-smoke" not found
+```
+
+The annotation still said `before-hook-creation,hook-succeeded`. The rule was
+documented, the file was not changed, and because the failure is a race the
+test passed often enough to look fixed. Eric asked "are you sure?" and it was
+not.
+
+Two lessons, both about verification rather than Kubernetes. A documented rule
+is not an applied one - the same mistake as the GitHub setting in 10.11, one
+level further in. And a race condition cannot be confirmed fixed by one
+passing run; it has to be confirmed by reading the file. The mutually
+exclusive pair is now stated in the manifest itself, next to the annotation,
+where anyone editing it will see it.
+
+CI is unaffected either way: `.github/workflows/ci.yml` runs `helm test`
+without `--logs`, so it never asks for logs from a deleted pod.
 KINDGEN_EOF
 
 echo '  Makefile'
@@ -1522,6 +1595,17 @@ make gitops-down      # delete the second cluster
 **On 8GB, run one cluster at a time.** `docker stop` the idle cluster's node
 container parks it with its volumes intact; `docker start` brings it back. That is
 much cheaper than deleting and recreating.
+
+### How often you merge a deploy pull request
+
+Once per change you actually make. A digest-only commit does not
+restart the pipeline (`paths-ignore` in `.github/workflows/ci.yml`),
+so merging one pull request does not produce the next one. If you see
+a second deploy pull request without having pushed anything, that is a
+bug, not the design.
+
+Close stale ones freely - only the newest digest matters, and the
+branch is force-pushed to the same name every time.
 
 ### How a change reaches the GitOps cluster
 
@@ -4548,10 +4632,19 @@ metadata:
     # this pod as an ordinary resource and re-run it on every sync.
     # Skip means Argo CD never applies this manifest at all.
     argocd.argoproj.io/hook: Skip
-    # Delete a leftover pod from a previous run before creating this one,
-    # and clean up after a pass. Failures are kept so you can read the
-    # logs with `kubectl logs`.
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    # Delete a leftover pod from a previous run before creating this
+    # one. That is the whole policy, deliberately.
+    #
+    # hook-succeeded must NOT be added here. `make smoke` runs
+    # `helm test --logs`, and Helm deletes a succeeded pod before it
+    # reads the logs, so a PASSING test reports
+    #   Phase: Succeeded
+    #   Error: unable to get pod logs for weather-smoke: pods
+    #   "weather-smoke" not found
+    # It is a race, so it fails only sometimes - the worst kind of
+    # green. before-hook-creation already keeps exactly one pod
+    # around, so nothing accumulates: the next run removes it.
+    helm.sh/hook-delete-policy: before-hook-creation
 spec:
   restartPolicy: Never
   containers:
@@ -4617,7 +4710,7 @@ image:
   # A digest cannot be moved or overwritten the way a tag can, so what
   # Argo CD deploys is exactly what CI built. When this is non-empty it
   # wins and `tag` is ignored (see weather.image in _helpers.tpl).
-  digest: ""
+  digest: "sha256:4cd5790da59d1ae4e284a5d6943f74cc074a1f661b94516e020025f71a001698"
 
   # Safe with a digest: the reference is immutable, so a cached image is
   # by definition the right one.
@@ -5221,6 +5314,29 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+  # Why the two StatefulSets would otherwise sit OutOfSync forever.
+  #
+  # A StatefulSet's volumeClaimTemplates are immutable after creation:
+  # the API server rejects any update to them. It also defaults fields
+  # into them that the chart does not set - volumeMode: Filesystem, the
+  # cluster's default storageClassName, an empty status block. So Argo
+  # CD compares git (without those fields) against the live object
+  # (with them), reports a difference, tries to sync, cannot change an
+  # immutable field, and reports the difference again. Nothing is
+  # wrong with the cluster - the app stays Healthy throughout - but the
+  # status is stuck on OutOfSync and hides real drift elsewhere.
+  #
+  # Ignoring this one path is the honest fix: it is a field Argo CD
+  # could never reconcile anyway. Changing a volume's size or class
+  # still requires deleting the StatefulSet (kubectl delete sts
+  # --cascade=orphan) and letting Argo CD recreate it, exactly as it
+  # did before this block existed.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+
   # Keep a short history so rollbacks are quick but etcd stays small.
   revisionHistoryLimit: 5
 KINDGEN_EOF
@@ -5264,6 +5380,20 @@ name: CI
 on:
   push:
     branches: [ main ]
+    # Merging the bump job's pull request is a push to main. Without
+    # this exclusion that push starts CI, CI rebuilds the image, and
+    # the rebuild lands on a DIFFERENT digest even though not one line
+    # of Go changed - the image config records a build timestamp, so
+    # the same source is not the same digest. A new digest means a new
+    # pull request, which you merge, which starts CI... The loop only
+    # ends when nothing rebuilds on a digest-only commit.
+    #
+    # Safe to skip: the bump job already ran `helm template` against
+    # this exact file and proved the digest reaches the pod spec, and
+    # the image being pinned is the one the full pipeline just passed
+    # on. Editing this file by hand skips CI too - do not.
+    paths-ignore:
+      - charts/weather/values-gitops.yaml
   pull_request:
     branches: [ main ]
 
@@ -5451,10 +5581,11 @@ jobs:
             --values charts/weather/values-gitops.yaml \
             | grep -qF "@$DIGEST" \
             || { echo "rendered manifests do not reference $DIGEST" >&2; exit 1; }
-      # No change means the image content did not change (the digest is
-      # content-addressed, so a docs-only commit rebuilds to the same
-      # digest). In that case this action does nothing at all, which is
-      # what stops the merge -> build -> bump loop.
+      # If the file is unchanged this action does nothing and no pull
+      # request appears. Do not rely on that alone to break the loop:
+      # two builds of identical source produce different digests (see
+      # the paths-ignore note at the top), so the file almost always
+      # does change. paths-ignore is what actually ends the cycle.
       - name: Open the deploy pull request
         uses: peter-evans/create-pull-request@v7
         with:

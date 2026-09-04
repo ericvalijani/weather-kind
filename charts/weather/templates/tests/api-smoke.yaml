@@ -26,10 +26,19 @@ metadata:
     # this pod as an ordinary resource and re-run it on every sync.
     # Skip means Argo CD never applies this manifest at all.
     argocd.argoproj.io/hook: Skip
-    # Delete a leftover pod from a previous run before creating this one,
-    # and clean up after a pass. Failures are kept so you can read the
-    # logs with `kubectl logs`.
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    # Delete a leftover pod from a previous run before creating this
+    # one. That is the whole policy, deliberately.
+    #
+    # hook-succeeded must NOT be added here. `make smoke` runs
+    # `helm test --logs`, and Helm deletes a succeeded pod before it
+    # reads the logs, so a PASSING test reports
+    #   Phase: Succeeded
+    #   Error: unable to get pod logs for weather-smoke: pods
+    #   "weather-smoke" not found
+    # It is a race, so it fails only sometimes - the worst kind of
+    # green. before-hook-creation already keeps exactly one pod
+    # around, so nothing accumulates: the next run removes it.
+    helm.sh/hook-delete-policy: before-hook-creation
 spec:
   restartPolicy: Never
   containers:
