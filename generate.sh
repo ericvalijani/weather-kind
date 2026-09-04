@@ -780,6 +780,27 @@ where anyone editing it will see it.
 
 CI is unaffected either way: `.github/workflows/ci.yml` runs `helm test`
 without `--logs`, so it never asks for logs from a deleted pod.
+
+### 10.19 The zip that reverted the user's own fix
+
+Eric fixed the kind pin in his repo, pushed it, and CI went green. He then
+copied in the zip I had just built, which put `version: v0.31.0` back, and CI
+failed again on the identical kubeadm error. Shown the diff, I diagnosed "an
+older zip overwrote it." It was the newest zip. Every zip since pass #12 had
+shipped v0.31.0, because pass #12 recorded the fix in this handoff and in the
+changelog without the file ever changing - and I verified the pin by reading
+HIS tree, which had his fix in it, and reported that as confirmation that mine
+was correct.
+
+That is the whole failure: I checked the copy that could not be wrong instead
+of the copy I was about to ship. Twice, because 10.18 is the same mistake on a
+different file, found in the same hour.
+
+The check that catches this class costs one line and is not about kind at all:
+after any pass, grep the tree - `generate.sh` included, since it embeds every
+file and will happily regenerate a stale one - for the value being replaced,
+and require zero hits. "I applied the fix" and "the string is gone" are
+different claims, and only the second one is testable.
 KINDGEN_EOF
 
 echo '  Makefile'
@@ -1563,6 +1584,12 @@ Everything is pinned, nothing is `:latest`. Checked at build time:
 kind node v1.37.0, Helm >= 4.2.4 (Helm 3.21.x still works, security
 fixes until Nov 2026), Argo CD v3.5.2, Go 1.26 (matching `go.mod`).
 Re-check before bumping — see PROMPT.md for the version policy.
+
+Your local `kind` must be v0.32.0 or newer for the same reason CI's is
+pinned to v0.33.0: `kindest/node:v1.37.0` needs a kubeadm config in the
+v1beta4 API, and older kind still writes v1beta3. `kind version` tells
+you; if it is older, the cluster fails at `Starting control-plane` with
+an "old API spec" error and nothing else in this repo will work.
 
 ## GitOps track (optional, second cluster)
 
@@ -5467,9 +5494,16 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v4.2.4
+      # These two versions are one pin, not two. kind generates the
+      # kubeadm config itself and picks the API version from the target
+      # Kubernetes release: v1beta3 up to 1.35.x, v1beta4 from 1.36.0 -
+      # and v1beta4 support landed after kind v0.31.0. Kubernetes 1.37
+      # removed v1beta3 outright, so kind v0.31.0 with this node image
+      # fails at `kubeadm init` with "old API spec" and the cluster
+      # never starts. Bump both together or neither.
       - uses: helm/kind-action@v1
         with:
-          version: v0.31.0
+          version: v0.33.0
           node_image: kindest/node:v1.37.0
           cluster_name: weather-ci
       - name: Build and load image

@@ -209,6 +209,12 @@ kind node v1.37.0, Helm >= 4.2.4 (Helm 3.21.x still works, security
 fixes until Nov 2026), Argo CD v3.5.2, Go 1.26 (matching `go.mod`).
 Re-check before bumping — see PROMPT.md for the version policy.
 
+Your local `kind` must be v0.32.0 or newer for the same reason CI's is
+pinned to v0.33.0: `kindest/node:v1.37.0` needs a kubeadm config in the
+v1beta4 API, and older kind still writes v1beta3. `kind version` tells
+you; if it is older, the cluster fails at `Starting control-plane` with
+an "old API spec" error and nothing else in this repo will work.
+
 ## GitOps track (optional, second cluster)
 
 The default workflow above is imperative: you run `make image`, Helm changes the

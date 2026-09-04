@@ -701,3 +701,24 @@ where anyone editing it will see it.
 
 CI is unaffected either way: `.github/workflows/ci.yml` runs `helm test`
 without `--logs`, so it never asks for logs from a deleted pod.
+
+### 10.19 The zip that reverted the user's own fix
+
+Eric fixed the kind pin in his repo, pushed it, and CI went green. He then
+copied in the zip I had just built, which put `version: v0.31.0` back, and CI
+failed again on the identical kubeadm error. Shown the diff, I diagnosed "an
+older zip overwrote it." It was the newest zip. Every zip since pass #12 had
+shipped v0.31.0, because pass #12 recorded the fix in this handoff and in the
+changelog without the file ever changing - and I verified the pin by reading
+HIS tree, which had his fix in it, and reported that as confirmation that mine
+was correct.
+
+That is the whole failure: I checked the copy that could not be wrong instead
+of the copy I was about to ship. Twice, because 10.18 is the same mistake on a
+different file, found in the same hour.
+
+The check that catches this class costs one line and is not about kind at all:
+after any pass, grep the tree - `generate.sh` included, since it embeds every
+file and will happily regenerate a stale one - for the value being replaced,
+and require zero hits. "I applied the fix" and "the string is gone" are
+different claims, and only the second one is testable.

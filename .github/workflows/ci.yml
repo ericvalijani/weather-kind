@@ -90,9 +90,16 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v4.2.4
+      # These two versions are one pin, not two. kind generates the
+      # kubeadm config itself and picks the API version from the target
+      # Kubernetes release: v1beta3 up to 1.35.x, v1beta4 from 1.36.0 -
+      # and v1beta4 support landed after kind v0.31.0. Kubernetes 1.37
+      # removed v1beta3 outright, so kind v0.31.0 with this node image
+      # fails at `kubeadm init` with "old API spec" and the cluster
+      # never starts. Bump both together or neither.
       - uses: helm/kind-action@v1
         with:
-          version: v0.31.0
+          version: v0.33.0
           node_image: kindest/node:v1.37.0
           cluster_name: weather-ci
       - name: Build and load image
