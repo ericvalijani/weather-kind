@@ -1,0 +1,65 @@
+# `helm test` target: proves the deployed release actually answers, not
+# just that it rendered. Run it with `make smoke` (or `helm test`), and
+# CI runs it as the e2e smoke step.
+#
+# It reuses the application image instead of pinning a curl image: that
+# image is already on the node, so there is nothing to pull (which also
+# means this works offline), and it is one less version to keep updated.
+# The base is alpine, so busybox wget is available.
+#
+# The checks walk the whole read path on purpose:
+#   1. api /healthz     - the api process is up
+#   2. store /healthz   - store is up and reachable through its Service
+#   3. api /cities      - api -> store gRPC -> Postgres actually works
+# A green /healthz with a broken gRPC link is the failure this catches.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "weather.fullname" . }}-smoke
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: smoke-test
+  annotations:
+    helm.sh/hook: test
+    # Argo CD renders the chart with `helm template` and applies the
+    # result, so it does not honour Helm's test hook - it would treat
+    # this pod as an ordinary resource and re-run it on every sync.
+    # Skip means Argo CD never applies this manifest at all.
+    argocd.argoproj.io/hook: Skip
+    # Delete a leftover pod from a previous run before creating this one,
+    # and clean up after a pass. Failures are kept so you can read the
+    # logs with `kubectl logs`.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: smoke
+      image: "{{ include "weather.image" . }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          api="{{ include "weather.fullname" . }}-api:{{ .Values.app.apiPort }}"
+          store="{{ include "weather.fullname" . }}-store:9091"
+
+          echo "GET $api/healthz"
+          wget -qO- "http://${api}/healthz"
+          echo
+
+          echo "GET $store/healthz"
+          wget -qO- "http://${store}/healthz"
+          echo
+
+          echo "GET $api/cities"
+          cities="$(wget -qO- "http://${api}/cities")"
+          echo "$cities"
+
+          # An empty list means api reached store but the seed never
+          # landed - a real failure, and invisible to /healthz.
+          case "$cities" in
+            *'"name"'*) echo "smoke test ok" ;;
+            *) echo "no cities returned" >&2; exit 1 ;;
+          esac
+      resources:
+        {{- toYaml .Values.resources.app | nindent 8 }}

@@ -1,0 +1,21 @@
+# Overrides used for the local kind cluster.
+# `make deploy` passes this file with -f, on top of values.yaml.
+#
+# Kept deliberately thin: if a setting is the same everywhere, it belongs
+# in values.yaml, not here.
+
+image:
+  repository: weather
+  tag: dev
+  pullPolicy: IfNotPresent
+
+app:
+  # Shorter than the 300s default so a fresh cluster fills up with data
+  # while you are still looking at it.
+  fetchInterval: 120s
+
+nodePorts:
+  enabled: true
+
+ingress:
+  enabled: false

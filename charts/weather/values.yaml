@@ -1,0 +1,101 @@
+# Default values for the weather chart.
+# Every image tag is pinned on purpose - no "latest" anywhere.
+
+# ---- application image (one image, three MODEs) ----------------------
+image:
+  repository: weather
+  tag: dev
+  # Set this and `tag` is ignored (see weather.image in _helpers.tpl).
+  # Empty here because weather:dev is built locally and side-loaded with
+  # `kind load` - it has no registry digest. The GitOps track pins one:
+  # see values-gitops.yaml, which CI keeps up to date.
+  digest: ""
+  # IfNotPresent is what makes `kind load docker-image` work: the image
+  # already exists on the node, so the kubelet must not try to pull it.
+  pullPolicy: IfNotPresent
+
+# ---- application settings (become a ConfigMap) -----------------------
+app:
+  apiPort: 8080
+  fetchInterval: 300s
+  cacheTtl: 120s
+  queue: weather.readings
+  # Seeds the cities table on the very first boot only. After that the
+  # database is the single source of truth.
+  cities: "Tehran:35.6892:51.3890,Berlin:52.5200:13.4050,Tokyo:35.6762:139.6503"
+  replicas:
+    api: 1
+    store: 1
+    consumer: 1
+
+# ---- data layer ------------------------------------------------------
+postgres:
+  image: postgres:18.4-alpine
+  user: weather
+  password: devpassword
+  database: weatherdb
+  # Postgres 18 expects the volume at /var/lib/postgresql, NOT at
+  # /var/lib/postgresql/data like every pre-18 tutorial shows.
+  mountPath: /var/lib/postgresql
+  storage: 2Gi
+
+redis:
+  image: redis:8.8.0-alpine
+
+rabbitmq:
+  image: rabbitmq:4.3.2-management-alpine
+  user: admin
+  password: devpassword
+  storage: 1Gi
+
+# ---- monitoring ------------------------------------------------------
+prometheus:
+  enabled: true
+  image: prom/prometheus:v3.12.0
+  scrapeInterval: 15s
+  storage: 2Gi
+
+grafana:
+  enabled: true
+  image: grafana/grafana:13.1.0
+  user: admin
+  password: devpassword
+  storage: 1Gi
+
+# ---- how you reach the cluster --------------------------------------
+# NodePorts are the default because they line up with the
+# extraPortMappings in kind/cluster.yaml - no ingress controller needed.
+nodePorts:
+  enabled: true
+  api: 30080
+  grafana: 30300
+  prometheus: 30900
+  rabbitmq: 31567
+
+# Optional. Only turn this on after installing an ingress controller
+# yourself (see README - ingress-nginx is retired, Traefik is the
+# maintained option). Requires a hosts-file entry for the host below.
+ingress:
+  enabled: false
+  className: traefik
+  host: weather.local
+  annotations: {}
+
+# ---- resources (sized for an 8GB laptop) -----------------------------
+resources:
+  app:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  data:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# Kind ships the local-path provisioner as the default StorageClass, so
+# leaving this empty is correct for a kind cluster.
+storageClassName: ""

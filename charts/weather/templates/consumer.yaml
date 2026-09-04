@@ -1,0 +1,37 @@
+# weather-consumer: MODE=consumer. Drains the queue and writes through
+# store's gRPC. No ports, no service - nothing ever calls it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "weather.fullname" . }}-consumer
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: consumer
+spec:
+  replicas: {{ .Values.app.replicas.consumer }}
+  selector:
+    matchLabels:
+      {{- include "weather.selector" . | nindent 6 }}
+      app.kubernetes.io/component: consumer
+  template:
+    metadata:
+      labels:
+        {{- include "weather.labels" . | nindent 8 }}
+        app.kubernetes.io/component: consumer
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: consumer
+          image: "{{ include "weather.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: MODE
+              value: consumer
+          envFrom:
+            - configMapRef:
+                name: {{ include "weather.fullname" . }}-env
+            - secretRef:
+                name: {{ include "weather.fullname" . }}-secrets
+          resources:
+            {{- toYaml .Values.resources.app | nindent 12 }}

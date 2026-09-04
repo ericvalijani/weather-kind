@@ -1,0 +1,46 @@
+# The GitOps entry point: Argo CD watches this repo and keeps the cluster
+# matching charts/weather.
+#
+# Before applying, set repoURL to your own fork/clone URL - or run
+#   make gitops REPO_URL=https://github.com/<you>/weather-kind.git
+# which patches it for you.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: weather
+  namespace: argocd
+  finalizers:
+    # Deleting the Application then also deletes what it created.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: weather
+  source:
+    repoURL: https://github.com/ericvalijani/weather-kind.git
+    targetRevision: main
+    path: charts/weather
+    helm:
+      valueFiles:
+        # NOT values-kind.yaml. That file points at weather:dev, which
+        # only exists inside the dev cluster because `kind load` put it
+        # there - Argo CD has no way to produce it. values-gitops.yaml
+        # pulls the GHCR image that CI built, pinned by digest.
+        - values-gitops.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: weather
+  syncPolicy:
+    automated:
+      # prune: delete resources removed from git
+      # selfHeal: revert manual kubectl edits back to what git says
+      #
+      # selfHeal is why this belongs on the weather-gitops cluster and
+      # not the dev one: it will undo a `make image` rollout within
+      # seconds, because that image is not what git says. Install this
+      # with `make gitops-up`, which creates the second cluster first.
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  # Keep a short history so rollbacks are quick but etcd stays small.
+  revisionHistoryLimit: 5

@@ -1,0 +1,28 @@
+{{- if .Values.ingress.enabled }}
+# Optional. Only useful once an ingress controller is installed in the
+# cluster (see README: ingress-nginx was retired in March 2026, Traefik
+# is the maintained option). Without a controller this object is inert.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "weather.fullname" . }}
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "weather.fullname" . }}-api
+                port:
+                  number: {{ .Values.app.apiPort }}
+{{- end }}

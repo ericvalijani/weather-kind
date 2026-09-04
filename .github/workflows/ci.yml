@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Must match go.mod and app/Dockerfile. A CI runner on an older
+  # toolchain than the module requires fails on the very first run.
+  GO_VERSION: "1.26"
+
+jobs:
+  # ---- 1. the Go code -------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install protoc and plugins
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate gRPC stubs
+        run: |
+          protoc --go_out=. --go_opt=module=weather \
+                 --go-grpc_out=. --go-grpc_opt=module=weather \
+                 proto/weather.proto
+      - name: Vet and test
+        run: |
+          go mod tidy
+          go vet ./...
+          go test ./...
+
+  # ---- 2. the chart ---------------------------------------------------
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - name: Lint and render
+        run: |
+          helm lint charts/weather --values charts/weather/values-kind.yaml
+          helm template weather charts/weather \
+            --values charts/weather/values-kind.yaml > /dev/null
+          # values-gitops.yaml needs this more than values-kind.yaml does,
+          # not less: it is the one values file a machine writes to (the
+          # bump job seds a digest into it). Unchecked, a bad write shows
+          # up as an Argo CD ComparisonError on the cluster instead of a
+          # red check on the pull request.
+          helm lint charts/weather --values charts/weather/values-gitops.yaml
+          helm template weather charts/weather \
+            --values charts/weather/values-gitops.yaml > /dev/null
+
+  # ---- 3. does it actually run on Kubernetes? -------------------------
+  # A real kind cluster in CI, so a broken manifest fails here instead of
+  # on the laptop.
+  e2e:
+    needs: [test, chart]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.31.0
+          node_image: kindest/node:v1.37.0
+          cluster_name: weather-ci
+      - name: Build and load image
+        run: |
+          docker build -t weather:ci app
+          kind load docker-image weather:ci --name weather-ci
+      - name: Install chart
+        run: |
+          helm upgrade --install weather charts/weather \
+            --namespace weather --create-namespace \
+            --set image.tag=ci \
+            --set nodePorts.enabled=false \
+            --wait --timeout 10m
+      # The chart's own test hook, so CI and `make smoke` check exactly
+      # the same thing: api -> store gRPC -> Postgres, not just /healthz.
+      - name: Smoke test the release
+        run: helm test weather --namespace weather --timeout 5m
+      - name: Smoke test output
+        if: always()
+        run: kubectl -n weather logs weather-smoke || true
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          kubectl -n weather get pods -o wide
+          kubectl -n weather describe pods
+          kubectl -n weather logs -l app.kubernetes.io/part-of=weather --all-containers --tail=100
+
+  # ---- 4. publish -----------------------------------------------------
+  build-and-push:
+    needs: e2e
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    # Passed to the bump job below. This is the digest of what was
+    # actually pushed - the one thing a tag cannot be trusted to tell you.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---- 5. hand the new image to GitOps --------------------------------
+  # Argo CD deploys what git says, and git does not change when a new
+  # image is pushed - so something has to write the new reference back.
+  # That is this job. It opens a pull request instead of pushing to main:
+  # you get a diff to approve, branch protection still applies, and CI
+  # does not trigger itself in a loop.
+  #
+  # Requires: Settings -> Actions -> General -> "Allow GitHub Actions to
+  # create and approve pull requests". Without it this job fails with a
+  # 403 and nothing else explains why.
+  bump:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin the digest that was just pushed
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          test -n "$DIGEST" || { echo "build-and-push produced no digest" >&2; exit 1; }
+          sed -i -E "s|^(  digest: ).*|\1\"$DIGEST\"|" charts/weather/values-gitops.yaml
+          grep -n '  digest:' charts/weather/values-gitops.yaml
+      # Prove the edit produced a chart that still renders, and that the
+      # digest actually reached the pod spec, before asking anyone to merge.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+      - name: Check the chart renders with the new digest
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          helm template weather charts/weather \
+            --values charts/weather/values-gitops.yaml \
+            | grep -qF "@$DIGEST" \
+            || { echo "rendered manifests do not reference $DIGEST" >&2; exit 1; }
+      # No change means the image content did not change (the digest is
+      # content-addressed, so a docs-only commit rebuilds to the same
+      # digest). In that case this action does nothing at all, which is
+      # what stops the merge -> build -> bump loop.
+      - name: Open the deploy pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deploy/image-digest
+          delete-branch: true
+          commit-message: "deploy: pin image ${{ needs.build-and-push.outputs.digest }}"
+          title: "deploy: pin image digest"
+          labels: deploy
+          body: |
+            CI built and pushed a new image. Merging this pull request is
+            what deploys it: Argo CD syncs `charts/weather` on the
+            `weather-gitops` cluster and rolls the three app deployments.
+
+            - digest: `${{ needs.build-and-push.outputs.digest }}`
+            - commit: ${{ github.sha }}
+
+            The digest is immutable, so what gets deployed is exactly
+            what the checks above passed on.

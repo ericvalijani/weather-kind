@@ -1,0 +1,25 @@
+syntax = "proto3";
+package weather;
+option go_package = "weather/genproto;genproto";
+
+message Reading {
+  string city = 1;
+  double latitude = 2;
+  double longitude = 3;
+  double temperature_c = 4;
+  double windspeed_kph = 5;
+  string observed_at = 6;
+  string source = 7;
+}
+
+message AddReadingResponse { int64 id = 1; }
+message GetLatestRequest { string city = 1; }
+message GetLatestResponse {
+  Reading reading = 1;
+  bool found = 2;
+}
+
+service WeatherStore {
+  rpc AddReading(Reading) returns (AddReadingResponse);
+  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
+}

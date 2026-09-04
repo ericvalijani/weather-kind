@@ -1,0 +1,47 @@
+# Overrides for the GitOps cluster (kind/cluster-gitops.yaml).
+#
+# Argo CD reads THIS file, not values-kind.yaml. The difference that
+# matters: the image comes from GHCR and is pinned by digest, because
+# nothing here is built locally or side-loaded with `kind load`.
+
+image:
+  # Must be lowercase and must match the GHCR package name, which is
+  # ghcr.io/<owner>/<repo> from the CI workflow.
+  repository: ghcr.io/ericvalijani/weather-kind
+
+  # Used only until CI has pinned a digest below. `latest` is a moving
+  # target on purpose here: it is the bootstrap value, not the steady
+  # state.
+  tag: latest
+
+  # The steady state. CI's `bump` job opens a pull request that fills
+  # this in with the digest it just pushed, e.g.
+  #   digest: "sha256:9f86d0818..."
+  # A digest cannot be moved or overwritten the way a tag can, so what
+  # Argo CD deploys is exactly what CI built. When this is non-empty it
+  # wins and `tag` is ignored (see weather.image in _helpers.tpl).
+  digest: ""
+
+  # Safe with a digest: the reference is immutable, so a cached image is
+  # by definition the right one.
+  pullPolicy: IfNotPresent
+
+app:
+  # The default, unlike values-kind.yaml. This cluster is meant to sit
+  # there and be reconciled, not to fill up with data while you watch.
+  fetchInterval: 300s
+
+nodePorts:
+  enabled: true
+
+ingress:
+  enabled: false
+
+# Off to leave room for Argo CD's five pods on an 8GB machine. This
+# cluster is for watching deployments happen, and the dev cluster still
+# has the full monitoring stack. Set either to true if you want them.
+prometheus:
+  enabled: false
+
+grafana:
+  enabled: false

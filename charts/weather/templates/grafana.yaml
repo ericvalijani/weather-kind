@@ -1,0 +1,168 @@
+{{- if .Values.grafana.enabled }}
+# Grafana, provisioned on first boot: one Prometheus datasource and one
+# starter dashboard. Nothing to click through in the UI to get a graph.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "weather.fullname" . }}-grafana-provisioning
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: {{ printf "http://%s-prometheus:9090" (include "weather.fullname" .) }}
+        isDefault: true
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "weather.fullname" . }}-grafana-dashboards
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  weather.json: |
+{{ .Files.Get "files/grafana-dashboard-weather.json" | indent 4 }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "weather.fullname" . }}-grafana
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.grafana.storage | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "weather.fullname" . }}-grafana
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "weather.selector" . | nindent 6 }}
+      app.kubernetes.io/component: grafana
+  template:
+    metadata:
+      labels:
+        {{- include "weather.labels" . | nindent 8 }}
+        app.kubernetes.io/component: grafana
+      annotations:
+        # Provisioning is mounted from ConfigMaps, so the same rule as the
+        # app pods applies: hash it or an edited datasource never lands.
+        # Hashes the values, not this file - including a template from
+        # inside itself would recurse forever.
+        checksum/config: {{ toYaml .Values.grafana | sha256sum }}
+        checksum/dashboard: {{ .Files.Get "files/grafana-dashboard-weather.json" | sha256sum }}
+    spec:
+      # The image runs as uid 472.
+      securityContext:
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.user | quote }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "weather.fullname" . }}-secrets
+                  key: GRAFANA_PASSWORD
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          volumeMounts:
+            - name: provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/grafana
+          resources:
+            {{- toYaml .Values.resources.data | nindent 12 }}
+      volumes:
+        # Same ConfigMap mounted twice, one key each, because Grafana
+        # expects datasources and dashboard providers in two directories.
+        - name: provisioning-datasources
+          configMap:
+            name: {{ include "weather.fullname" . }}-grafana-provisioning
+            items:
+              - key: datasource.yaml
+                path: datasource.yaml
+        - name: provisioning-dashboards
+          configMap:
+            name: {{ include "weather.fullname" . }}-grafana-provisioning
+            items:
+              - key: dashboards.yaml
+                path: dashboards.yaml
+        - name: dashboards
+          configMap:
+            name: {{ include "weather.fullname" . }}-grafana-dashboards
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "weather.fullname" . }}-grafana
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "weather.fullname" . }}-grafana
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  type: {{ if .Values.nodePorts.enabled }}NodePort{{ else }}ClusterIP{{ end }}
+  selector:
+    {{- include "weather.selector" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      {{- if .Values.nodePorts.enabled }}
+      nodePort: {{ .Values.nodePorts.grafana }}
+      {{- end }}
+{{- end }}

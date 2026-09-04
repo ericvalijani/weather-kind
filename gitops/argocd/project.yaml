@@ -1,0 +1,27 @@
+# A dedicated AppProject instead of using "default": it scopes what the
+# weather Application is allowed to touch, which is the whole point of
+# having projects at all.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: weather
+  namespace: argocd
+spec:
+  description: Weather stack (kind + Helm + Argo CD track)
+  sourceRepos:
+    - https://github.com/ericvalijani/weather-kind.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: weather
+  # Almost nothing cluster-scoped - but Namespace has to be allowed.
+  # The Application syncs with CreateNamespace=true, and Argo CD checks
+  # that creation against this list: with an empty list the first sync
+  # on a fresh cluster fails with
+  #   Namespace "weather" is not permitted in project "weather"
+  # and nothing else in this repo creates that namespace.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

@@ -1,0 +1,41 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Temperature (C) by city",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "celsius" }, "overrides": [] },
+      "targets": [ { "expr": "weather_temperature_celsius", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Windspeed (km/h) by city",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [ { "expr": "weather_windspeed_kph", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Readings rate: published vs stored",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        { "expr": "rate(weather_readings_published_total[5m])", "refId": "A", "legendFormat": "published" },
+        { "expr": "rate(weather_readings_stored_total[5m])", "refId": "B", "legendFormat": "stored" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["weather"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "title": "Weather Overview",
+  "uid": "weather-overview",
+  "version": 1
+}

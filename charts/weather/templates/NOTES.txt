@@ -1,0 +1,29 @@
+weather {{ .Chart.Version }} deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Watch it come up:
+  kubectl -n {{ .Release.Namespace }} get pods -w
+
+{{ if .Values.nodePorts.enabled -}}
+Open (kind maps these NodePorts to localhost). The host ports below are
+the default cluster's; the GitOps cluster maps the same NodePorts to
+8082, 3001, 9091 and 15673 - see kind/cluster-gitops.yaml.
+  UI          http://localhost:8080
+{{ if .Values.grafana.enabled -}}
+  Grafana     http://localhost:3000     ({{ .Values.grafana.user }} / value of grafana.password)
+{{ end -}}
+{{ if .Values.prometheus.enabled -}}
+  Prometheus  http://localhost:9090
+{{ end -}}
+  RabbitMQ    http://localhost:15672    ({{ .Values.rabbitmq.user }} / value of rabbitmq.password)
+{{- else -}}
+NodePorts are disabled, so reach the UI with a port-forward:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "weather.fullname" . }}-api {{ .Values.app.apiPort }}:{{ .Values.app.apiPort }}
+{{- end }}
+
+{{ if .Values.ingress.enabled -}}
+Ingress is enabled for host {{ .Values.ingress.host }} (class {{ .Values.ingress.className }}).
+It only works if a matching ingress controller is installed in this cluster.
+{{- end }}
+
+Seeded cities (first boot only, the database is the source of truth after that):
+  {{ .Values.app.cities }}

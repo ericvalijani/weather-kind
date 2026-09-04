@@ -1,0 +1,55 @@
+# Kind cluster for the weather stack.
+#
+# One control-plane + two workers, so scheduling, node affinity and
+# rollouts behave like a real (small) cluster instead of a single box.
+#
+# extraPortMappings publish the NodePorts the Helm chart creates onto
+# localhost, so no ingress controller is required to click around the UIs:
+#
+#   http://localhost:8080  -> weather-api      (NodePort 30080)
+#   http://localhost:3000  -> grafana          (NodePort 30300)
+#   http://localhost:9090  -> prometheus       (NodePort 30900)
+#   http://localhost:15672 -> rabbitmq mgmt    (NodePort 31567)
+#
+# Ports 80/443 are deliberately NOT mapped: on a normal Ubuntu box
+# something is often already listening there, and a busy host port makes
+# `kind create cluster` fail outright. If you later install an ingress
+# controller and set ingress.enabled=true, add them here and recreate
+# the cluster:
+#
+#   - containerPort: 80
+#     hostPort: 80
+#     protocol: TCP
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: weather
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+    kubeadmConfigPatches:
+      # Label the node so an ingress controller (if you add one) can be
+      # pinned here with a nodeSelector.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP
+      - containerPort: 30900
+        hostPort: 9090
+        protocol: TCP
+      - containerPort: 31567
+        hostPort: 15672
+        protocol: TCP
+
+  - role: worker
+    image: kindest/node:v1.37.0
+  - role: worker
+    image: kindest/node:v1.37.0

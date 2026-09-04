@@ -1,0 +1,57 @@
+# Every non-secret env var the three Go modes read, in one ConfigMap -
+# the Kubernetes equivalent of the compose track's single .env file.
+#
+# Service names are built from the release name, so the app never has to
+# hardcode "weather-postgres": Helm fills it in.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "weather.fullname" . }}-env
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+data:
+  PGHOST: {{ include "weather.fullname" . }}-postgres
+  PGPORT: "5432"
+  POSTGRES_DB: {{ .Values.postgres.database | quote }}
+  POSTGRES_USER: {{ .Values.postgres.user | quote }}
+
+  AMQP_HOST: {{ include "weather.fullname" . }}-rabbitmq
+  AMQP_PORT: "5672"
+  QUEUE: {{ .Values.app.queue | quote }}
+  RABBITMQ_DEFAULT_USER: {{ .Values.rabbitmq.user | quote }}
+
+  REDIS_ADDR: {{ include "weather.fullname" . }}-redis:6379
+  CACHE_TTL: {{ .Values.app.cacheTtl | quote }}
+
+  STORE_ADDR: {{ include "weather.fullname" . }}-store:9090
+  STORE_HTTP_ADDR: {{ printf "http://%s-store:9091" (include "weather.fullname" .) | quote }}
+  API_PORT: {{ .Values.app.apiPort | quote }}
+  FETCH_INTERVAL: {{ .Values.app.fetchInterval | quote }}
+  CITIES: {{ .Values.app.cities | quote }}
+---
+# Dev credentials. Fine for a laptop cluster; for anything real, use a
+# sealed secret / external secret store instead of chart values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "weather.fullname" . }}-secrets
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: {{ .Values.postgres.password | quote }}
+  RABBITMQ_DEFAULT_PASS: {{ .Values.rabbitmq.password | quote }}
+  GRAFANA_PASSWORD: {{ .Values.grafana.password | quote }}
+---
+# The Postgres schema. Mounted into the postgres container's
+# /docker-entrypoint-initdb.d, which the image only runs on a genuinely
+# empty data directory.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "weather.fullname" . }}-initdb
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+data:
+  init.sql: |
+{{ .Files.Get "files/init.sql" | indent 4 }}

@@ -1,0 +1,15 @@
+# Local kubeconfig exports, if you ever write one out
+kubeconfig
+*.kubeconfig
+
+# Helm packaging output
+*.tgz
+charts/*/charts/
+
+# Generated gRPC stubs - produced inside the Docker build, never committed
+app/genproto/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/

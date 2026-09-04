@@ -1,0 +1,108 @@
+# RabbitMQ: decouples the api's fetch loop from the consumer's writes.
+# StatefulSet for the same reason as Postgres - it keeps a volume.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "weather.fullname" . }}-rabbitmq
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+spec:
+  serviceName: {{ include "weather.fullname" . }}-rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "weather.selector" . | nindent 6 }}
+      app.kubernetes.io/component: rabbitmq
+  template:
+    metadata:
+      labels:
+        {{- include "weather.labels" . | nindent 8 }}
+        app.kubernetes.io/component: rabbitmq
+    spec:
+      # The image runs as uid 999; fsGroup makes the mounted volume
+      # writable for it.
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: rabbitmq
+          image: {{ .Values.rabbitmq.image | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              value: {{ .Values.rabbitmq.user | quote }}
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "weather.fullname" . }}-secrets
+                  key: RABBITMQ_DEFAULT_PASS
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          resources:
+            {{- toYaml .Values.resources.data | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.rabbitmq.storage | quote }}
+---
+# In-cluster service: AMQP stays internal.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "weather.fullname" . }}-rabbitmq
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "weather.selector" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+    - name: management
+      port: 15672
+      targetPort: management
+{{- if .Values.nodePorts.enabled }}
+---
+# Separate NodePort service so only the management UI is exposed to the
+# host (http://localhost:15672), never the AMQP port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "weather.fullname" . }}-rabbitmq-ui
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+spec:
+  type: NodePort
+  selector:
+    {{- include "weather.selector" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+  ports:
+    - name: management
+      port: 15672
+      targetPort: management
+      nodePort: {{ .Values.nodePorts.rabbitmq }}
+{{- end }}

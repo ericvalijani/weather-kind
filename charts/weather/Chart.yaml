@@ -1,0 +1,14 @@
+apiVersion: v2
+name: weather
+description: Multi-service weather stack (Go store/api/consumer + Postgres, Redis, RabbitMQ, Prometheus, Grafana)
+type: application
+
+# version    = chart version, bump on any template/values change
+# appVersion = the Go application image tag this chart was written against
+version: 0.1.0
+appVersion: "dev"
+
+kubeVersion: ">=1.30.0-0"
+
+maintainers:
+  - name: ericvalijani

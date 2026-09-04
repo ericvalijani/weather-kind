@@ -1,0 +1,101 @@
+# Postgres: the permanent record. StatefulSet (not Deployment) because it
+# owns a volume and its identity matters.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "weather.fullname" . }}-postgres
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ include "weather.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "weather.selector" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "weather.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+      annotations:
+        # Recreates the pod when init.sql changes. Note this does NOT
+        # re-run the schema: the image only executes initdb scripts on a
+        # genuinely empty data directory. A schema change needs a fresh
+        # volume (make clean && make deploy).
+        checksum/initdb: {{ .Files.Get "files/init.sql" | sha256sum }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "weather.fullname" . }}-secrets
+                  key: POSTGRES_PASSWORD
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            # Postgres 18 moved its expected mount point here from
+            # /var/lib/postgresql/data. Mounting the old path makes the
+            # container refuse to start.
+            - name: data
+              mountPath: {{ .Values.postgres.mountPath | quote }}
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.data | nindent 12 }}
+      volumes:
+        - name: initdb
+          configMap:
+            name: {{ include "weather.fullname" . }}-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "weather.fullname" . }}-postgres
+  labels:
+    {{- include "weather.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "weather.selector" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

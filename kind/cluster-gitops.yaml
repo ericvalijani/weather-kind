@@ -1,0 +1,54 @@
+# Second kind cluster: the GitOps / Argo CD track.
+#
+# Why a separate cluster at all: the Argo CD Application syncs with
+# selfHeal enabled, which means it actively reverts anything that does
+# not match git. On the dev cluster that would undo `make image` a few
+# seconds after you run it. So the two workflows get one cluster each:
+#
+#   weather          `make up`   - local weather:dev image, you edit it
+#   weather-gitops   `make gitops-up` - GHCR image by digest, git decides
+#
+# Host ports differ from the dev cluster's so both can run at the same
+# time. A port that is already taken makes `kind create cluster` fail
+# outright, which is why they cannot overlap.
+#
+#   http://localhost:8082  -> weather-api      (NodePort 30080)
+#   http://localhost:3001  -> grafana          (NodePort 30300)
+#   http://localhost:9091  -> prometheus       (NodePort 30900)
+#   http://localhost:15673 -> rabbitmq mgmt    (NodePort 31567)
+#
+# The api is on 8082, not 8081, because 8081 is where `make argocd-ui`
+# port-forwards the Argo CD UI. Two things on one host port is the same
+# failure as two clusters on one host port.
+#
+# Grafana and Prometheus are disabled in values-gitops.yaml, so 3001 and
+# 9091 currently map to NodePorts nothing listens on. That is deliberate:
+# kind cannot add port mappings to a cluster that already exists, so
+# keeping them means flipping prometheus.enabled or grafana.enabled to
+# true needs no cluster rebuild. The cost is two held host ports.
+#
+# One control-plane and no workers, unlike kind/cluster.yaml: this
+# cluster exists to watch Argo CD reconcile, not to study scheduling,
+# and Argo CD itself needs ~400Mi on top of the stack. On an 8GB laptop
+# run one cluster at a time - `docker stop`/`docker start` the node
+# container keeps its volumes, which is much cheaper than recreating.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: weather-gitops
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8082
+        protocol: TCP
+      - containerPort: 30300
+        hostPort: 3001
+        protocol: TCP
+      - containerPort: 30900
+        hostPort: 9091
+        protocol: TCP
+      - containerPort: 31567
+        hostPort: 15673
+        protocol: TCP

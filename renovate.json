@@ -1,0 +1,95 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Asia/Tehran",
+  "schedule": ["before 9am on monday"],
+  "prConcurrentLimit": 3,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Patch and minor bumps of the data layer are safe to batch; CI installs the chart in a real kind cluster before any of them can merge.",
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "container images"
+    },
+    {
+      "description": "Majors get their own PR. Postgres 18 moved its data directory - a major bump here is a behaviour change, never a version string change.",
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["major"],
+      "labels": ["dependencies", "breaking"],
+      "groupName": null
+    },
+    {
+      "description": "The kind node image decides the Kubernetes version. Always alone, always read the kind release notes first.",
+      "matchPackageNames": ["kindest/node"],
+      "groupName": null,
+      "labels": ["dependencies", "kubernetes"]
+    },
+    {
+      "description": "Go toolchain: go.mod, the Dockerfile builder and CI's GO_VERSION must move together or CI fails on the first run.",
+      "matchPackageNames": ["go", "golang", "golang/go"],
+      "groupName": "go toolchain"
+    },
+    {
+      "description": "Actions are low risk and noisy; batch them.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "kindest/node, which no standard manager understands. Both cluster files AND ci.yml: the e2e job pins node_image separately, and if it lags behind, CI validates a Kubernetes version nobody runs.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^kind/cluster.*\\.yaml$/",
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": ["image:\\s*(?<depName>kindest/node):(?<currentValue>v[0-9.]+)"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "Argo CD, pinned in the Makefile and installed from a versioned manifest URL.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^Makefile$/", "/^kind/bootstrap.sh$/"],
+      "matchStrings": ["ARGOCD_VERSION\\s*[?:]?=\\s*\"?(?<currentValue>v[0-9.]+)\"?", "ARGOCD_VERSION:-(?<currentValue>v[0-9.]+)"],
+      "depNameTemplate": "argoproj/argo-cd",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "protoc plugin versions, pinned identically in the Makefile, the Dockerfile and CI.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/",
+        "/^app/Dockerfile$/",
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": ["(?<depName>google\\.golang\\.org/[^@\\s]+)@(?<currentValue>v[0-9.]+)"],
+      "datasourceTemplate": "go"
+    },
+    {
+      "description": "CI's Go version. No standard manager sees it, and it has to move together with go.mod and the Dockerfile builder - otherwise the toolchain PR arrives with setup-go on the old version and the first step fails with 'go.mod requires go >= ...'. Trimmed to major.minor to match how it is written.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["GO_VERSION:[^0-9]*(?<currentValue>[0-9]+\\.[0-9]+)"],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "extractVersionTemplate": "^(?<version>[0-9]+\\.[0-9]+)"
+    },
+    {
+      "description": "The helm binary CI installs. This is a `with:` input, so the github-actions manager - which only reads `uses:` refs - never touches it.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["azure/setup-helm@v[0-9]+\\n\\s+with:\\n\\s+version: (?<currentValue>v[0-9.]+)"],
+      "depNameTemplate": "helm/helm",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "The kind binary CI installs, same blind spot as helm. Note this is kind itself, not kindest/node - the two version independently.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["helm/kind-action@v[0-9]+\\n\\s+with:\\n\\s+version: (?<currentValue>v[0-9.]+)"],
+      "depNameTemplate": "kubernetes-sigs/kind",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}
